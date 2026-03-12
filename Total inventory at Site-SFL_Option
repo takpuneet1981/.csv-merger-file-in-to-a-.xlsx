@@ -1,0 +1,115 @@
+import os
+import pandas as pd
+from pathlib import Path
+
+# Define paths
+folder_path = r"C:\Users\puneet.tak\Desktop\XYZ\RAW_SFL"
+excel_path  = r"C:\Users\puneet.tak\Desktop\XYZ\test.xlsx"
+
+# ── STEP 1: Collect all CSV files ─────────────────────────────────────────────
+csv_files = list(Path(folder_path).glob('*.csv'))
+if not csv_files:
+    print("No CSV files found in the folder.")
+    exit()
+
+# ── STEP 2: Read and clean each CSV ───────────────────────────────────────────
+all_data = []
+
+for file_path in csv_files:
+    try:
+        df = pd.read_csv(
+            file_path,
+            dtype=str,
+            keep_default_na=False,
+            na_filter=False
+        )
+
+        # Strip spaces from all column names
+        df.columns = df.columns.str.strip().str.lower()
+
+        # Strip spaces from all cell values
+        df = df.apply(lambda col: col.str.strip())
+
+        # Remove second row (index 1) — dotted separator line
+        if len(df) > 1:
+            df = df.drop(index=df.index[1]).reset_index(drop=True)
+
+        # Remove junk rows (all cells are dots, dashes, spaces only)
+        junk_mask = df.apply(
+            lambda row: row.str.fullmatch(r'[\.\-_=\s]*').all(), axis=1
+        )
+        df = df[~junk_mask].reset_index(drop=True)
+
+        all_data.append(df)
+        print(f"  ✓ {file_path.name}  →  {len(df)} rows loaded")
+
+    except Exception as e:
+        print(f"  ✗ Error: {file_path.name} — {e}")
+
+if not all_data:
+    print("No data to merge.")
+    exit()
+
+# ── STEP 3: Merge all CSV files ───────────────────────────────────────────────
+combined_df = pd.concat(all_data, ignore_index=True)
+print(f"\n{'─'*60}")
+print(f"  Total rows after merging all files  :  {len(combined_df)}")
+print(f"{'─'*60}")
+
+# ── STEP 4: Locate column 'Total Inventory at Site' ───────────────────────────
+def find_col(columns, keyword1, keyword2):
+    for col in columns:
+        if keyword1.lower() in col and keyword2.lower() in col:
+            return col
+    return None
+
+col_site = find_col(combined_df.columns.tolist(), "site", "inventory")
+
+if not col_site:
+    print("\n  ⛔ ERROR: Column 'Total Inventory at Site' was not found.")
+    print(f"  Columns available: {combined_df.columns.tolist()}")
+    print("  Check spelling in your CSV and re-run.")
+    exit()
+
+print(f"  Column located    :  '{col_site}'")
+
+# ── STEP 5: Define what counts as zero / null / empty ─────────────────────────
+BAD_VALUES = {
+    "", "0", "0.0", "0.00", "0.000",
+    "nan", "null", "none", "na", "n/a", "#n/a", "-", "nil"
+}
+
+def is_bad(series: pd.Series) -> pd.Series:
+    s = series.astype(str).str.strip().str.lower()
+    is_bad_token    = s.isin(BAD_VALUES)
+    is_numeric_zero = pd.to_numeric(s, errors='coerce').fillna(1) == 0
+    return is_bad_token | is_numeric_zero
+
+# ── STEP 6: Capture stats BEFORE filter ───────────────────────────────────────
+rows_before = len(combined_df)
+sum_before  = pd.to_numeric(combined_df[col_site], errors='coerce').fillna(0).sum()
+
+# ── STEP 7: Delete rows where 'Total Inventory at Site' is 0 / null / empty ───
+rows_to_delete = is_bad(combined_df[col_site])
+combined_df    = combined_df[~rows_to_delete].reset_index(drop=True)
+
+# ── STEP 8: Capture stats AFTER filter ────────────────────────────────────────
+rows_after   = len(combined_df)
+rows_dropped = rows_before - rows_after
+sum_after    = pd.to_numeric(combined_df[col_site], errors='coerce').fillna(0).sum()
+
+# ── STEP 9: Print summary ──────────────────────────────────────────────────────
+print(f"\n{'─'*60}")
+print(f"  Filter Summary  —  Total Inventory at Site")
+print(f"{'─'*60}")
+print(f"  Rows after merge                      :  {rows_before}")
+print(f"  Rows deleted  (0 / null / empty)      :  {rows_dropped}")
+print(f"  Rows kept in final output             :  {rows_after}")
+print(f"{'─'*60}")
+print(f"  Column sum  BEFORE filter             :  {sum_before:,.2f}")
+print(f"  Column sum  AFTER  filter             :  {sum_after:,.2f}")
+print(f"{'─'*60}")
+
+# ── STEP 10: Save to Excel ─────────────────────────────────────────────────────
+combined_df.to_excel(excel_path, sheet_name='Data', index=False, engine='openpyxl')
+print(f"\n  ✓ Final data saved to: {excel_path}")
