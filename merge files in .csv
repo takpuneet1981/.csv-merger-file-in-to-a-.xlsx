@@ -1,0 +1,73 @@
+import pandas as pd
+from pathlib import Path
+import os
+
+# Define paths
+folder_path   = r"C:\Users\puneet.tak\Desktop\XYZ\RAW_SFL"
+output_folder = r"C:\Users\puneet.tak\Desktop\XYZ"
+
+# ── AUTO-NAME: Find next available filename (x1, x2, x3...) ──────────────────
+counter = 1
+while True:
+    csv_path = os.path.join(output_folder, f"x{counter}.csv")
+    if not os.path.exists(csv_path):
+        break
+    counter += 1
+
+file_name = f"x{counter}"
+print(f"\n  Output file name selected  :  {file_name}.csv")
+
+# ── STEP 1: Collect all CSV files ─────────────────────────────────────────────
+csv_files = list(Path(folder_path).glob('*.csv'))
+if not csv_files:
+    print("No CSV files found in the folder.")
+    exit()
+
+# ── STEP 2: Read and clean each CSV ───────────────────────────────────────────
+all_data = []
+
+for file_path in csv_files:
+    try:
+        df = pd.read_csv(
+            file_path,
+            dtype=str,
+            keep_default_na=False,
+            na_filter=False
+        )
+        df.columns = df.columns.str.strip()
+
+        if len(df) > 1:
+            df = df.drop(index=df.index[1]).reset_index(drop=True)
+
+        junk_mask = df.apply(
+            lambda row: row.astype(str).str.fullmatch(r'[\.\-_=\s]*').all(), axis=1
+        )
+        df = df[~junk_mask].reset_index(drop=True)
+
+        all_data.append(df)
+        print(f"  ✓ {file_path.name}  →  {len(df)} rows loaded")
+
+    except Exception as e:
+        print(f"  ✗ Error: {file_path.name} — {e}")
+
+if not all_data:
+    print("No data to merge.")
+    exit()
+
+# ── STEP 3: Merge all CSV files ───────────────────────────────────────────────
+combined_df = pd.concat(all_data, ignore_index=True)
+print(f"\n  Total rows after merging  :  {len(combined_df)}")
+
+# ── STEP 4: Save final merged CSV ─────────────────────────────────────────────
+combined_df.to_csv(csv_path, index=False)
+
+# ── STEP 5: Final output — print file name clearly ────────────────────────────
+print(f"""
+  ╔══════════════════════════════════════════════════════════╗
+  ║           ✓  PROCESS COMPLETED SUCCESSFULLY              ║
+  ╠══════════════════════════════════════════════════════════╣
+  ║  File Name  →  {file_name}.csv
+  ║  Location   →  {output_folder}
+  ║  Total Rows →  {len(combined_df)}
+  ╚══════════════════════════════════════════════════════════╝
+""")
