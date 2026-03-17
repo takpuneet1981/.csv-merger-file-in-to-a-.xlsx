@@ -1,0 +1,145 @@
+import pandas as pd
+from pathlib import Path
+
+# Define paths
+folder_path   = Path(r"C:\Users\puneet.tak\Desktop\XYZ\RAW_PFR")
+output_folder = Path(r"C:\Users\puneet.tak\Desktop\XYZ")
+
+# ── AUTO-NAME: Find next available filename (PFR_001, PFR_002...) ─────────────
+counter = 1
+while True:
+    csv_path = output_folder / f"PFR_{counter:03d}.csv"
+    if not csv_path.exists():
+        break
+    counter += 1
+
+file_name = f"PFR_{counter:03d}"
+print(f"\n  Output file name selected  :  {file_name}.csv")
+
+# ── STEP 1: Collect all CSV files ─────────────────────────────────────────────
+csv_files = list(folder_path.glob('*.csv'))
+if not csv_files:
+    print("  No CSV files found in the folder.")
+    exit()
+
+print(f"  Total CSV files found  :  {len(csv_files)}")
+
+# ── STEP 2: Read and clean each CSV ───────────────────────────────────────────
+all_data = []
+
+for file_path in csv_files:
+    try:
+        df = pd.read_csv(
+            file_path,
+            dtype=str,
+            keep_default_na=False,
+            na_filter=False
+        )
+
+        # Strip spaces from column names
+        df.columns = df.columns.str.strip()
+
+        # Remove second row (index 1) — dotted separator line
+        if len(df) > 1:
+            df = df.drop(index=df.index[1]).reset_index(drop=True)
+
+        # Remove junk rows (all cells are dots, dashes, spaces only)
+        junk_mask = df.apply(
+            lambda row: row.astype(str).str.fullmatch(r'[\.\-_=\s]*').all(), axis=1
+        )
+        df = df[~junk_mask].reset_index(drop=True)
+
+        all_data.append(df)
+        print(f"  ✓ {file_path.name}  →  {len(df)} rows loaded")
+
+    except Exception as e:
+        print(f"  ✗ Error: {file_path.name}  →  {e}")
+
+if not all_data:
+    print("  No data to merge.")
+    exit()
+
+# ── STEP 3: Merge all CSV files ───────────────────────────────────────────────
+combined_df = pd.concat(all_data, ignore_index=True)
+rows_after_merge = len(combined_df)
+print(f"\n  Total rows after merging  :  {rows_after_merge}")
+
+# ── STEP 4: Rename column headers with sequence numbers ───────────────────────
+combined_df.columns = [f"{i+1}-{col}" for i, col in enumerate(combined_df.columns)]
+print(f"  Total columns renamed     :  {len(combined_df.columns)}")
+
+# ── STEP 5: FILTER 1 — Remove rows where '5-Division' = 'EB-Accessories' ──────
+col_division = "5-Division"
+if col_division in combined_df.columns:
+    rows_before_f1 = len(combined_df)
+    combined_df    = combined_df[combined_df[col_division].str.strip() != "EB-Accessories"].reset_index(drop=True)
+    rows_after_f1  = len(combined_df)
+    removed_f1     = rows_before_f1 - rows_after_f1
+else:
+    print(f"  ⚠ WARNING: Column '{col_division}' not found — Filter 1 skipped")
+    removed_f1 = 0
+
+# ── STEP 6: FILTER 2 — Remove rows where '20-WHSiteStkAfterAllocReplToday' < 20
+col_wh = "20-WHSiteStkAfterAllocReplToday"
+if col_wh in combined_df.columns:
+    rows_before_f2      = len(combined_df)
+    combined_df[col_wh] = pd.to_numeric(combined_df[col_wh], errors='coerce')
+    combined_df         = combined_df[combined_df[col_wh] >= 20].reset_index(drop=True)
+    rows_after_f2       = len(combined_df)
+    removed_f2          = rows_before_f2 - rows_after_f2
+else:
+    print(f"  ⚠ WARNING: Column '{col_wh}' not found — Filter 2 skipped")
+    removed_f2 = 0
+
+# ── STEP 7: FILTER 3 — Remove rows where '30-NumofSizesatWHAfterAllocReplToday' <= 2
+col_sizes = "30-NumofSizesatWHAfterAllocReplToday"
+if col_sizes in combined_df.columns:
+    rows_before_f3         = len(combined_df)
+    combined_df[col_sizes] = pd.to_numeric(combined_df[col_sizes], errors='coerce')
+    combined_df            = combined_df[combined_df[col_sizes] > 2].reset_index(drop=True)
+    rows_after_f3          = len(combined_df)
+    removed_f3             = rows_before_f3 - rows_after_f3
+else:
+    print(f"  ⚠ WARNING: Column '{col_sizes}' not found — Filter 3 skipped")
+    removed_f3 = 0
+
+# ── STEP 8: FILTER 4 — Remove rows where '8-SubClass' starts with 'BN' or 'BC'
+col_subclass = "8-SubClass"
+if col_subclass in combined_df.columns:
+    rows_before_f4 = len(combined_df)
+    combined_df    = combined_df[
+        ~combined_df[col_subclass].str.strip().str.upper().str.startswith(("BN", "BC"))
+    ].reset_index(drop=True)
+    rows_after_f4  = len(combined_df)
+    removed_f4     = rows_before_f4 - rows_after_f4
+else:
+    print(f"  ⚠ WARNING: Column '{col_subclass}' not found — Filter 4 skipped")
+    removed_f4 = 0
+
+# ── STEP 9: Save final filtered CSV ───────────────────────────────────────────
+combined_df.to_csv(csv_path, index=False)
+print(f"  ✓ File saved  :  {csv_path}")
+
+# ── STEP 10: Final summary ─────────────────────────────────────────────────────
+total_removed = rows_after_merge - len(combined_df)
+
+print(f"""
+  ╔══════════════════════════════════════════════════════════════╗
+  ║            ✓  PROCESS COMPLETED SUCCESSFULLY                 ║
+  ╠══════════════════════════════════════════════════════════════╣
+  ║  File Name      →  {file_name}.csv
+  ║  Location       →  {output_folder}
+  ╠══════════════════════════════════════════════════════════════╣
+  ║  FILTER SUMMARY                                              ║
+  ╠══════════════════════════════════════════════════════════════╣
+  ║  Rows after merge                        :  {rows_after_merge:<10}        ║
+  ║  Filter 1 removed  (EB-Accessories)      :  {removed_f1:<10}        ║
+  ║  Filter 2 removed  (WH Stock < 20)       :  {removed_f2:<10}        ║
+  ║  Filter 3 removed  (Sizes <= 2)          :  {removed_f3:<10}        ║
+  ║  Filter 4 removed  (BN or BC prefix)     :  {removed_f4:<10}        ║
+  ║  Total rows removed                      :  {total_removed:<10}        ║
+  ║  Final rows in output                    :  {len(combined_df):<10}        ║
+  ╠══════════════════════════════════════════════════════════════╣
+  ║  Total Cols     →  {len(combined_df.columns)}
+  ╚══════════════════════════════════════════════════════════════╝
+""")
