@@ -1,17 +1,20 @@
 import pandas as pd
+import re
 from pathlib import Path
 
 # ── Define file paths ──────────────────────────────────────────────────────────
-folder_path = Path(r"C:\Users\puneet.tak\Desktop\XYZ")
-tw_path     = folder_path / "TW.csv"
-lw_path     = folder_path / "LW.csv"
-ag_path     = folder_path / "AG_Report_Site_Validity.csv"
-sales_path  = folder_path / "Sales.csv"
+input_folder  = Path(r"C:\Users\puneet.tak\Desktop\XYZ\Availability_csv")
+output_folder = Path(r"C:\Users\puneet.tak\Desktop\XYZ")
+
+tw_path    = input_folder / "TW.csv"
+lw_path    = input_folder / "LW.csv"
+ag_path    = input_folder / "Site.csv"
+sales_path = input_folder / "Sales.csv"
 
 # ── AUTO-NAME: Find next available filename (AVL_x1, AVL_x2...) ───────────────
 counter = 1
 while True:
-    output_path = folder_path / f"AVL_x{counter}.csv"
+    output_path = output_folder / f"AVL_x{counter}.csv"
     if not output_path.exists():
         break
     counter += 1
@@ -25,10 +28,9 @@ print("=" * 65)
 print("\n  STEP 1: Loading all 4 CSV files...")
 print("-" * 65)
 
-# Check all files exist before loading
-for name, path in [("TW", tw_path), ("LW", lw_path), ("AG Report", ag_path), ("Sales", sales_path)]:
+for name, path in [("TW", tw_path), ("LW", lw_path), ("Site", ag_path), ("Sales", sales_path)]:
     if not path.exists():
-        print(f"  ⛔ ERROR: {name} file not found at {path}")
+        print(f"  ERROR: {name} file not found at {path}")
         exit()
 
 tw_df    = pd.read_csv(tw_path,    dtype=str, keep_default_na=False, na_filter=False, encoding='utf-8-sig')
@@ -36,7 +38,6 @@ lw_df    = pd.read_csv(lw_path,    dtype=str, keep_default_na=False, na_filter=F
 ag_df    = pd.read_csv(ag_path,    dtype=str, keep_default_na=False, na_filter=False, encoding='utf-8-sig')
 sales_df = pd.read_csv(sales_path, dtype=str, keep_default_na=False, na_filter=False, encoding='utf-8-sig')
 
-# Strip spaces from all column names
 tw_df.columns    = tw_df.columns.str.strip()
 lw_df.columns    = lw_df.columns.str.strip()
 ag_df.columns    = ag_df.columns.str.strip()
@@ -48,7 +49,7 @@ print()
 print(f"  ✓ LW file loaded       :  {len(lw_df)} rows   |  {len(lw_df.columns)} columns")
 print(f"    Columns  :  {list(lw_df.columns)}")
 print()
-print(f"  ✓ AG Report loaded     :  {len(ag_df)} rows   |  {len(ag_df.columns)} columns")
+print(f"  ✓ Site file loaded     :  {len(ag_df)} rows   |  {len(ag_df.columns)} columns")
 print(f"    Columns  :  {list(ag_df.columns)}")
 print()
 print(f"  ✓ Sales file loaded    :  {len(sales_df)} rows   |  {len(sales_df.columns)} columns")
@@ -56,44 +57,27 @@ print(f"    Columns  :  {list(sales_df.columns)}")
 
 # ── STEP 2: Create Foreign Key in each file ────────────────────────────────────
 print("\n" + "=" * 65)
-print("  STEP 2: Creating Foreign Keys (no spaces, no special chars)...")
+print("  STEP 2: Creating Foreign Keys...")
+print("  Rule: Remove special characters only — keep spaces between words")
 print("-" * 65)
 
 def clean_key(value):
-    """Remove all spaces and special characters from key value."""
-    import re
-    return re.sub(r'[^a-zA-Z0-9]', '', str(value).strip())
+    # ✅ Keep spaces and alphanumeric — remove ONLY special characters
+    # Before: re.sub(r'[^a-zA-Z0-9]', '', ...) — removed spaces too
+    # After : re.sub(r'[^a-zA-Z0-9 ]', '', ...) — keeps spaces
+    cleaned = re.sub(r'[^a-zA-Z0-9 ]', '', str(value).strip())
+    return cleaned
 
-# TW → Stock Location + Assortment Group
-tw_df["Foreign Key"] = (
-    tw_df["Stock Location"].apply(clean_key) +
-    tw_df["Assortment Group"].apply(clean_key)
-)
-
-# LW → stocklocationname + AG Name
-lw_df["Foreign Key"] = (
-    lw_df["stocklocationname"].apply(clean_key) +
-    lw_df["AG Name"].apply(clean_key)
-)
-
-# AG → stocklocationname + AG Name
-ag_df["Foreign Key"] = (
-    ag_df["stocklocationname"].apply(clean_key) +
-    ag_df["AG Name"].apply(clean_key)
-)
-
-# Sales → Business Area + Product Hierarchy Description
-sales_df["Foreign Key"] = (
-    sales_df["Business Area"].apply(clean_key) +
-    sales_df["Product Hierarchy Description"].apply(clean_key)
-)
+tw_df["Foreign Key"]    = tw_df["Stock Location"].apply(clean_key)                   + tw_df["Assortment Group"].apply(clean_key)
+lw_df["Foreign Key"]    = lw_df["stocklocationname"].apply(clean_key)                + lw_df["AG Name"].apply(clean_key)
+ag_df["Foreign Key"]    = ag_df["stocklocationname"].apply(clean_key)                + ag_df["AG Name"].apply(clean_key)
+sales_df["Foreign Key"] = sales_df["Business Area"].apply(clean_key)                 + sales_df["Product Hierarchy Description"].apply(clean_key)
 
 print(f"  TW    Foreign Key sample  :  {tw_df['Foreign Key'].iloc[0]}")
 print(f"  LW    Foreign Key sample  :  {lw_df['Foreign Key'].iloc[0]}")
-print(f"  AG    Foreign Key sample  :  {ag_df['Foreign Key'].iloc[0]}")
+print(f"  Site  Foreign Key sample  :  {ag_df['Foreign Key'].iloc[0]}")
 print(f"  Sales Foreign Key sample  :  {sales_df['Foreign Key'].iloc[0]}")
 
-# Verify key overlap
 tw_keys    = set(tw_df["Foreign Key"])
 lw_keys    = set(lw_df["Foreign Key"])
 ag_keys    = set(ag_df["Foreign Key"])
@@ -101,10 +85,10 @@ sales_keys = set(sales_df["Foreign Key"])
 
 print(f"\n  TW unique keys            :  {len(tw_keys)}")
 print(f"  LW unique keys            :  {len(lw_keys)}")
-print(f"  AG unique keys            :  {len(ag_keys)}")
+print(f"  Site unique keys          :  {len(ag_keys)}")
 print(f"  Sales unique keys         :  {len(sales_keys)}")
 print(f"  TW keys matching LW       :  {len(tw_keys & lw_keys)}")
-print(f"  TW keys matching AG       :  {len(tw_keys & ag_keys)}")
+print(f"  TW keys matching Site     :  {len(tw_keys & ag_keys)}")
 print(f"  TW keys matching Sales    :  {len(tw_keys & sales_keys)}")
 
 # ── STEP 3: Prepare TW — Main File ────────────────────────────────────────────
@@ -142,9 +126,9 @@ print(f"  ✓ All unused columns dropped")
 print(f"  LW columns ready          :  {list(lw_df.columns)}")
 print(f"  LW total rows             :  {len(lw_df)}")
 
-# ── STEP 5: Prepare AG Report File ────────────────────────────────────────────
+# ── STEP 5: Prepare Site File ──────────────────────────────────────────────────
 print("\n" + "=" * 65)
-print("  STEP 5: Preparing AG Report Site Validity File...")
+print("  STEP 5: Preparing Site File...")
 print("-" * 65)
 
 ag_df = ag_df[["Foreign Key", "ValidFamiliesSite"]].rename(columns={
@@ -152,8 +136,8 @@ ag_df = ag_df[["Foreign Key", "ValidFamiliesSite"]].rename(columns={
 })
 
 print(f"  ✓ All unused columns dropped")
-print(f"  AG columns ready          :  {list(ag_df.columns)}")
-print(f"  AG total rows             :  {len(ag_df)}")
+print(f"  Site columns ready        :  {list(ag_df.columns)}")
+print(f"  Site total rows           :  {len(ag_df)}")
 
 # ── STEP 6: Prepare Sales File ────────────────────────────────────────────────
 print("\n" + "=" * 65)
@@ -178,15 +162,15 @@ print("-" * 65)
 merged_df = tw_df.copy()
 print(f"  Starting with TW          :  {len(merged_df)} rows")
 
-merged_df = merged_df.merge(lw_df, on="Foreign Key", how="left")
-matched_lw = merged_df["LW-ValidFamiliesSite"].replace("", pd.NA).notna().sum()
+merged_df    = merged_df.merge(lw_df, on="Foreign Key", how="left")
+matched_lw   = merged_df["LW-ValidFamiliesSite"].replace("", pd.NA).notna().sum()
 print(f"  After merging LW          :  {len(merged_df)} rows  |  {matched_lw} rows matched from LW")
 
-merged_df = merged_df.merge(ag_df, on="Foreign Key", how="left")
-matched_ag = merged_df["TW-ValidFamiliesSite"].replace("", pd.NA).notna().sum()
-print(f"  After merging AG Report   :  {len(merged_df)} rows  |  {matched_ag} rows matched from AG")
+merged_df    = merged_df.merge(ag_df, on="Foreign Key", how="left")
+matched_ag   = merged_df["TW-ValidFamiliesSite"].replace("", pd.NA).notna().sum()
+print(f"  After merging Site        :  {len(merged_df)} rows  |  {matched_ag} rows matched from Site")
 
-merged_df = merged_df.merge(sales_df, on="Foreign Key", how="left")
+merged_df     = merged_df.merge(sales_df, on="Foreign Key", how="left")
 matched_sales = merged_df["TW-ROS"].notna().sum()
 print(f"  After merging Sales       :  {len(merged_df)} rows  |  {matched_sales} rows matched from Sales")
 
@@ -221,7 +205,6 @@ final_columns = [
     "TW-ROS",
 ]
 
-# Keep only columns that exist
 final_columns = [col for col in final_columns if col in merged_df.columns]
 merged_df     = merged_df[final_columns]
 
@@ -242,26 +225,27 @@ print(f"""
   ║            ✓  PROCESS COMPLETED SUCCESSFULLY                 ║
   ╠══════════════════════════════════════════════════════════════╣
   ║  Output File    →  {file_name}.csv
-  ║  Location       →  {str(folder_path)}
+  ║  Input Folder   →  {str(input_folder)}
+  ║  Output Folder  →  {str(output_folder)}
   ╠══════════════════════════════════════════════════════════════╣
   ║  FILE DETAILS                                                ║
   ╠══════════════════════════════════════════════════════════════╣
-  ║  TW rows loaded              :  {len(tw_df):<10}                  ║
-  ║  LW rows loaded              :  {len(lw_df):<10}                  ║
-  ║  AG rows loaded              :  {len(ag_df):<10}                  ║
-  ║  Sales rows loaded           :  {len(sales_df):<10}                  ║
+  ║  TW rows loaded              :  {len(tw_df):<10}             ║
+  ║  LW rows loaded              :  {len(lw_df):<10}             ║
+  ║  Site rows loaded            :  {len(ag_df):<10}             ║
+  ║  Sales rows loaded           :  {len(sales_df):<10}          ║
   ╠══════════════════════════════════════════════════════════════╣
   ║  MATCH SUMMARY                                               ║
   ╠══════════════════════════════════════════════════════════════╣
-  ║  TW keys matching LW         :  {len(tw_keys & lw_keys):<10}                  ║
-  ║  TW keys matching AG         :  {len(tw_keys & ag_keys):<10}                  ║
-  ║  TW keys matching Sales      :  {len(tw_keys & sales_keys):<10}                  ║
+  ║  TW keys matching LW         :  {len(tw_keys & lw_keys):<10}   ║
+  ║  TW keys matching Site       :  {len(tw_keys & ag_keys):<10}   ║
+  ║  TW keys matching Sales      :  {len(tw_keys & sales_keys):<10} ║
   ╠══════════════════════════════════════════════════════════════╣
   ║  FINAL OUTPUT                                                ║
   ╠══════════════════════════════════════════════════════════════╣
-  ║  Final rows                  :  {len(merged_df):<10}                  ║
-  ║  Final columns               :  {len(merged_df.columns):<10}                  ║
-  ║  Foreign Key format          :  StockLocationAssortmentGroup  ║
+  ║  Final rows                  :  {len(merged_df):<10}         ║
+  ║  Final columns               :  {len(merged_df.columns):<10} ║
+  ║  Foreign Key format          :  StockLocation AssortmentGroup ║
   ║  Join Type                   :  Left Join on TW               ║
   ╚══════════════════════════════════════════════════════════════╝
 """)
