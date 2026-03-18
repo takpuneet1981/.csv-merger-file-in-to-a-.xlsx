@@ -1,0 +1,140 @@
+import pandas as pd
+from pathlib import Path
+
+# Define paths
+folder_path   = Path(r"C:\Users\puneet.tak\Desktop\XYZ\RAW_SFL")
+output_folder = Path(r"C:\Users\puneet.tak\Desktop\XYZ")
+
+# Excel row limit
+EXCEL_LIMIT = 1048576
+
+# Bad values that count as zero or null
+BAD_VALUES = {"", "0", "0.0", "0.00", "0.000", "nan", "null", "none", "na", "n/a", "#n/a", "-", "nil"}
+
+# ── AUTO-NAME: Find next available filename (At_Site_SFL_x1, At_Site_SFL_x2...) 
+counter = 1
+while True:
+    csv_path = output_folder / f"At_Site_SFL_x{counter}.csv"
+    if not csv_path.exists():
+        break
+    counter += 1
+
+file_name = f"At_Site_SFL_x{counter}"
+print(f"\n  Output file name selected  :  {file_name}.csv")
+
+# ── STEP 1: Collect all CSV files ─────────────────────────────────────────────
+csv_files = list(folder_path.glob('*.csv'))
+if not csv_files:
+    print("  No CSV files found in the folder.")
+    exit()
+
+print(f"  Total CSV files found  :  {len(csv_files)}")
+
+# ── STEP 2: Read and clean each CSV ───────────────────────────────────────────
+all_data = []
+
+for file_path in csv_files:
+    try:
+        df = pd.read_csv(
+            file_path,
+            dtype=str,
+            keep_default_na=False,
+            na_filter=False
+        )
+
+        df.columns = df.columns.str.strip()
+
+        if len(df) > 1:
+            df = df.drop(index=df.index[1]).reset_index(drop=True)
+
+        junk_mask = df.apply(
+            lambda row: row.astype(str).str.fullmatch(r'[\.\-_=\s]*').all(), axis=1
+        )
+        df = df[~junk_mask].reset_index(drop=True)
+
+        all_data.append(df)
+        print(f"  ✓ {file_path.name}  →  {len(df)} rows loaded")
+
+    except Exception as e:
+        print(f"  ✗ Error: {file_path.name}  →  {e}")
+
+if not all_data:
+    print("  No data to merge.")
+    exit()
+
+# ── STEP 3: Merge all CSV files ───────────────────────────────────────────────
+combined_df      = pd.concat(all_data, ignore_index=True)
+rows_after_merge = len(combined_df)
+print(f"\n  Total rows after merging  :  {rows_after_merge}")
+
+# ── EXCEL LIMIT WARNING ────────────────────────────────────────────────────────
+if rows_after_merge > EXCEL_LIMIT:
+    print(f"""
+  ╔══════════════════════════════════════════════════════════════╗
+  ║   ⚠⚠⚠   WARNING  —  FILE EXCEEDS EXCEL ROW LIMIT   ⚠⚠⚠   ║
+  ╠══════════════════════════════════════════════════════════════╣
+  ║  Merged rows      :  {rows_after_merge:<38}║
+  ║  Excel max limit  :  {EXCEL_LIMIT:<38}║
+  ║  Rows over limit  :  {rows_after_merge - EXCEL_LIMIT:<38}║
+  ║                                                              ║
+  ║  This file CANNOT be fully opened in Excel.                  ║
+  ║  Rows beyond 10,48,576 will be CUT OFF in Excel.            ║
+  ╚══════════════════════════════════════════════════════════════╝
+""")
+else:
+    print(f"  ✓ File size OK  :  {rows_after_merge} rows  (within Excel limit of {EXCEL_LIMIT})")
+
+# ── STEP 4: Filter — Remove rows where 'Total Inventory at Site' is 0 or Null ─
+def find_col(columns, *keywords):
+    for col in columns:
+        if all(kw.lower() in col.lower() for kw in keywords):
+            return col
+    return None
+
+col_site = find_col(combined_df.columns.tolist(), "total", "inventory", "site")
+
+if col_site:
+    rows_before_filter = len(combined_df)
+
+    def is_bad(series):
+        s = series.astype(str).str.strip().str.lower()
+        is_bad_token    = s.isin(BAD_VALUES)
+        is_numeric_zero = pd.to_numeric(s, errors='coerce').fillna(1) == 0
+        return is_bad_token | is_numeric_zero
+
+    rows_to_delete = is_bad(combined_df[col_site])
+    combined_df    = combined_df[~rows_to_delete].reset_index(drop=True)
+    rows_removed   = rows_before_filter - len(combined_df)
+
+    print(f"\n  Column matched            :  '{col_site}'")
+    print(f"  Rows removed (0 or null)  :  {rows_removed}")
+    print(f"  Rows kept in output       :  {len(combined_df)}")
+else:
+    print(f"\n  ⚠ WARNING: Column 'Total Inventory at Site' not found — filter skipped")
+    print(f"  Columns available: {combined_df.columns.tolist()}")
+    rows_before_filter = rows_after_merge
+    rows_removed       = 0
+
+# ── STEP 5: Save final filtered CSV ───────────────────────────────────────────
+combined_df.to_csv(csv_path, index=False)
+print(f"\n  ✓ File saved  :  {csv_path}")
+
+# ── STEP 6: Final summary ──────────────────────────────────────────────────────
+excel_status = "⚠ EXCEEDS Excel limit" if len(combined_df) > EXCEL_LIMIT else "✓ Within Excel limit"
+
+print(f"""
+  ╔══════════════════════════════════════════════════════════════╗
+  ║            ✓  PROCESS COMPLETED SUCCESSFULLY                 ║
+  ╠══════════════════════════════════════════════════════════════╣
+  ║  File Name      →  {file_name}.csv
+  ║  Location       →  {output_folder}
+  ╠══════════════════════════════════════════════════════════════╣
+  ║  FILTER SUMMARY                                              ║
+  ╠══════════════════════════════════════════════════════════════╣
+  ║  Rows after merge                        :  {rows_after_merge:<10}        ║
+  ║  Rows removed  (0 or null at Site)       :  {rows_removed:<10}        ║
+  ║  Final rows in output                    :  {len(combined_df):<10}        ║
+  ╠══════════════════════════════════════════════════════════════╣
+  ║  Excel Status   →  {excel_status}
+  ╚══════════════════════════════════════════════════════════════╝
+""")
