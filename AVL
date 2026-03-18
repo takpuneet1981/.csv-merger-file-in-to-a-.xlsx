@@ -1,0 +1,267 @@
+import pandas as pd
+from pathlib import Path
+
+# ── Define file paths ──────────────────────────────────────────────────────────
+folder_path = Path(r"C:\Users\puneet.tak\Desktop\XYZ")
+tw_path     = folder_path / "TW.csv"
+lw_path     = folder_path / "LW.csv"
+ag_path     = folder_path / "AG_Report_Site_Validity.csv"
+sales_path  = folder_path / "Sales.csv"
+
+# ── AUTO-NAME: Find next available filename (AVL_x1, AVL_x2...) ───────────────
+counter = 1
+while True:
+    output_path = folder_path / f"AVL_x{counter}.csv"
+    if not output_path.exists():
+        break
+    counter += 1
+
+file_name = f"AVL_x{counter}"
+print("=" * 65)
+print(f"  Output file name selected  :  {file_name}.csv")
+print("=" * 65)
+
+# ── STEP 1: Load all 4 CSV files ──────────────────────────────────────────────
+print("\n  STEP 1: Loading all 4 CSV files...")
+print("-" * 65)
+
+# Check all files exist before loading
+for name, path in [("TW", tw_path), ("LW", lw_path), ("AG Report", ag_path), ("Sales", sales_path)]:
+    if not path.exists():
+        print(f"  ⛔ ERROR: {name} file not found at {path}")
+        exit()
+
+tw_df    = pd.read_csv(tw_path,    dtype=str, keep_default_na=False, na_filter=False, encoding='utf-8-sig')
+lw_df    = pd.read_csv(lw_path,    dtype=str, keep_default_na=False, na_filter=False, encoding='utf-8-sig')
+ag_df    = pd.read_csv(ag_path,    dtype=str, keep_default_na=False, na_filter=False, encoding='utf-8-sig')
+sales_df = pd.read_csv(sales_path, dtype=str, keep_default_na=False, na_filter=False, encoding='utf-8-sig')
+
+# Strip spaces from all column names
+tw_df.columns    = tw_df.columns.str.strip()
+lw_df.columns    = lw_df.columns.str.strip()
+ag_df.columns    = ag_df.columns.str.strip()
+sales_df.columns = sales_df.columns.str.strip()
+
+print(f"  ✓ TW file loaded       :  {len(tw_df)} rows   |  {len(tw_df.columns)} columns")
+print(f"    Columns  :  {list(tw_df.columns)}")
+print()
+print(f"  ✓ LW file loaded       :  {len(lw_df)} rows   |  {len(lw_df.columns)} columns")
+print(f"    Columns  :  {list(lw_df.columns)}")
+print()
+print(f"  ✓ AG Report loaded     :  {len(ag_df)} rows   |  {len(ag_df.columns)} columns")
+print(f"    Columns  :  {list(ag_df.columns)}")
+print()
+print(f"  ✓ Sales file loaded    :  {len(sales_df)} rows   |  {len(sales_df.columns)} columns")
+print(f"    Columns  :  {list(sales_df.columns)}")
+
+# ── STEP 2: Create Foreign Key in each file ────────────────────────────────────
+print("\n" + "=" * 65)
+print("  STEP 2: Creating Foreign Keys (no spaces, no special chars)...")
+print("-" * 65)
+
+def clean_key(value):
+    """Remove all spaces and special characters from key value."""
+    import re
+    return re.sub(r'[^a-zA-Z0-9]', '', str(value).strip())
+
+# TW → Stock Location + Assortment Group
+tw_df["Foreign Key"] = (
+    tw_df["Stock Location"].apply(clean_key) +
+    tw_df["Assortment Group"].apply(clean_key)
+)
+
+# LW → stocklocationname + AG Name
+lw_df["Foreign Key"] = (
+    lw_df["stocklocationname"].apply(clean_key) +
+    lw_df["AG Name"].apply(clean_key)
+)
+
+# AG → stocklocationname + AG Name
+ag_df["Foreign Key"] = (
+    ag_df["stocklocationname"].apply(clean_key) +
+    ag_df["AG Name"].apply(clean_key)
+)
+
+# Sales → Business Area + Product Hierarchy Description
+sales_df["Foreign Key"] = (
+    sales_df["Business Area"].apply(clean_key) +
+    sales_df["Product Hierarchy Description"].apply(clean_key)
+)
+
+print(f"  TW    Foreign Key sample  :  {tw_df['Foreign Key'].iloc[0]}")
+print(f"  LW    Foreign Key sample  :  {lw_df['Foreign Key'].iloc[0]}")
+print(f"  AG    Foreign Key sample  :  {ag_df['Foreign Key'].iloc[0]}")
+print(f"  Sales Foreign Key sample  :  {sales_df['Foreign Key'].iloc[0]}")
+
+# Verify key overlap
+tw_keys    = set(tw_df["Foreign Key"])
+lw_keys    = set(lw_df["Foreign Key"])
+ag_keys    = set(ag_df["Foreign Key"])
+sales_keys = set(sales_df["Foreign Key"])
+
+print(f"\n  TW unique keys            :  {len(tw_keys)}")
+print(f"  LW unique keys            :  {len(lw_keys)}")
+print(f"  AG unique keys            :  {len(ag_keys)}")
+print(f"  Sales unique keys         :  {len(sales_keys)}")
+print(f"  TW keys matching LW       :  {len(tw_keys & lw_keys)}")
+print(f"  TW keys matching AG       :  {len(tw_keys & ag_keys)}")
+print(f"  TW keys matching Sales    :  {len(tw_keys & sales_keys)}")
+
+# ── STEP 3: Prepare TW — Main File ────────────────────────────────────────────
+print("\n" + "=" * 65)
+print("  STEP 3: Preparing TW (Main File)...")
+print("-" * 65)
+
+tw_df = tw_df.rename(columns={
+    "Total Inventory In Pipe"  : "TW-Total Inventory In Pipe",
+    "SKU Families"             : "TW-SKU Families",
+    "Valid SKU Families"       : "TW-Valid SKU Families",
+    "Newly Invalid Families"   : "TW-Newly Invalid Families",
+    "Expired Invalid Families" : "TW-Expired Invalid Families",
+    "MBQ"                      : "TW-MBQ",
+    "Total Inventory at Site"  : "TW-Total Inventory at Site",
+    "Variety Target"           : "TW-Variety Target",
+})
+
+tw_df = tw_df.drop(columns=["Min Variety", "Max Variety"], errors='ignore')
+
+print(f"  ✓ Columns renamed and Min/Max Variety dropped")
+print(f"  TW columns ready          :  {list(tw_df.columns)}")
+print(f"  TW total rows             :  {len(tw_df)}")
+
+# ── STEP 4: Prepare LW File ───────────────────────────────────────────────────
+print("\n" + "=" * 65)
+print("  STEP 4: Preparing LW File...")
+print("-" * 65)
+
+lw_df = lw_df[["Foreign Key", "ValidFamiliesSite"]].rename(columns={
+    "ValidFamiliesSite" : "LW-ValidFamiliesSite"
+})
+
+print(f"  ✓ All unused columns dropped")
+print(f"  LW columns ready          :  {list(lw_df.columns)}")
+print(f"  LW total rows             :  {len(lw_df)}")
+
+# ── STEP 5: Prepare AG Report File ────────────────────────────────────────────
+print("\n" + "=" * 65)
+print("  STEP 5: Preparing AG Report Site Validity File...")
+print("-" * 65)
+
+ag_df = ag_df[["Foreign Key", "ValidFamiliesSite"]].rename(columns={
+    "ValidFamiliesSite" : "TW-ValidFamiliesSite"
+})
+
+print(f"  ✓ All unused columns dropped")
+print(f"  AG columns ready          :  {list(ag_df.columns)}")
+print(f"  AG total rows             :  {len(ag_df)}")
+
+# ── STEP 6: Prepare Sales File ────────────────────────────────────────────────
+print("\n" + "=" * 65)
+print("  STEP 6: Preparing Sales File...")
+print("-" * 65)
+
+sales_df["Total"] = pd.to_numeric(sales_df["Total"], errors='coerce').fillna(0)
+rows_before_agg   = len(sales_df)
+sales_df          = sales_df.groupby("Foreign Key", as_index=False)["Total"].sum()
+sales_df          = sales_df.rename(columns={"Total": "TW-ROS"})
+
+print(f"  ✓ Sales aggregated by Foreign Key (Sum of Total)")
+print(f"  Rows before aggregation   :  {rows_before_agg}")
+print(f"  Rows after aggregation    :  {len(sales_df)}")
+print(f"  Sales columns ready       :  {list(sales_df.columns)}")
+
+# ── STEP 7: Merge all files on Foreign Key ────────────────────────────────────
+print("\n" + "=" * 65)
+print("  STEP 7: Merging all files on Foreign Key...")
+print("-" * 65)
+
+merged_df = tw_df.copy()
+print(f"  Starting with TW          :  {len(merged_df)} rows")
+
+merged_df = merged_df.merge(lw_df, on="Foreign Key", how="left")
+matched_lw = merged_df["LW-ValidFamiliesSite"].replace("", pd.NA).notna().sum()
+print(f"  After merging LW          :  {len(merged_df)} rows  |  {matched_lw} rows matched from LW")
+
+merged_df = merged_df.merge(ag_df, on="Foreign Key", how="left")
+matched_ag = merged_df["TW-ValidFamiliesSite"].replace("", pd.NA).notna().sum()
+print(f"  After merging AG Report   :  {len(merged_df)} rows  |  {matched_ag} rows matched from AG")
+
+merged_df = merged_df.merge(sales_df, on="Foreign Key", how="left")
+matched_sales = merged_df["TW-ROS"].notna().sum()
+print(f"  After merging Sales       :  {len(merged_df)} rows  |  {matched_sales} rows matched from Sales")
+
+# ── STEP 8: Arrange final column order ────────────────────────────────────────
+print("\n" + "=" * 65)
+print("  STEP 8: Arranging final column order...")
+print("-" * 65)
+
+final_columns = [
+    "Foreign Key",
+    "Stock Location",
+    "Stock Location Description",
+    "Area",
+    "Region",
+    "District",
+    "Format",
+    "Store Class",
+    "Stop Replenishment",
+    "Assortment Group",
+    "Assortment Group Description",
+    "Display Group",
+    "TW-Total Inventory In Pipe",
+    "TW-SKU Families",
+    "TW-Valid SKU Families",
+    "TW-Newly Invalid Families",
+    "TW-Expired Invalid Families",
+    "TW-MBQ",
+    "TW-Total Inventory at Site",
+    "TW-Variety Target",
+    "LW-ValidFamiliesSite",
+    "TW-ValidFamiliesSite",
+    "TW-ROS",
+]
+
+# Keep only columns that exist
+final_columns = [col for col in final_columns if col in merged_df.columns]
+merged_df     = merged_df[final_columns]
+
+print(f"  ✓ Columns arranged in final order")
+print(f"  Final column list         :  {list(merged_df.columns)}")
+
+# ── STEP 9: Save final output ─────────────────────────────────────────────────
+print("\n" + "=" * 65)
+print("  STEP 9: Saving final merged file...")
+print("-" * 65)
+
+merged_df.to_csv(output_path, index=False)
+print(f"  ✓ File saved to           :  {output_path}")
+
+# ── FINAL SUMMARY ──────────────────────────────────────────────────────────────
+print(f"""
+  ╔══════════════════════════════════════════════════════════════╗
+  ║            ✓  PROCESS COMPLETED SUCCESSFULLY                 ║
+  ╠══════════════════════════════════════════════════════════════╣
+  ║  Output File    →  {file_name}.csv
+  ║  Location       →  {str(folder_path)}
+  ╠══════════════════════════════════════════════════════════════╣
+  ║  FILE DETAILS                                                ║
+  ╠══════════════════════════════════════════════════════════════╣
+  ║  TW rows loaded              :  {len(tw_df):<10}                  ║
+  ║  LW rows loaded              :  {len(lw_df):<10}                  ║
+  ║  AG rows loaded              :  {len(ag_df):<10}                  ║
+  ║  Sales rows loaded           :  {len(sales_df):<10}                  ║
+  ╠══════════════════════════════════════════════════════════════╣
+  ║  MATCH SUMMARY                                               ║
+  ╠══════════════════════════════════════════════════════════════╣
+  ║  TW keys matching LW         :  {len(tw_keys & lw_keys):<10}                  ║
+  ║  TW keys matching AG         :  {len(tw_keys & ag_keys):<10}                  ║
+  ║  TW keys matching Sales      :  {len(tw_keys & sales_keys):<10}                  ║
+  ╠══════════════════════════════════════════════════════════════╣
+  ║  FINAL OUTPUT                                                ║
+  ╠══════════════════════════════════════════════════════════════╣
+  ║  Final rows                  :  {len(merged_df):<10}                  ║
+  ║  Final columns               :  {len(merged_df.columns):<10}                  ║
+  ║  Foreign Key format          :  StockLocationAssortmentGroup  ║
+  ║  Join Type                   :  Left Join on TW               ║
+  ╚══════════════════════════════════════════════════════════════╝
+""")
