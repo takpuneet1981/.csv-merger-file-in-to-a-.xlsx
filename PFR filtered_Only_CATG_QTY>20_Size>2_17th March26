@@ -36,14 +36,11 @@ for file_path in csv_files:
             na_filter=False
         )
 
-        # Strip spaces from column names
         df.columns = df.columns.str.strip()
 
-        # Remove second row (index 1) — dotted separator line
         if len(df) > 1:
             df = df.drop(index=df.index[1]).reset_index(drop=True)
 
-        # Remove junk rows (all cells are dots, dashes, spaces only)
         junk_mask = df.apply(
             lambda row: row.astype(str).str.fullmatch(r'[\.\-_=\s]*').all(), axis=1
         )
@@ -60,7 +57,7 @@ if not all_data:
     exit()
 
 # ── STEP 3: Merge all CSV files ───────────────────────────────────────────────
-combined_df = pd.concat(all_data, ignore_index=True)
+combined_df      = pd.concat(all_data, ignore_index=True)
 rows_after_merge = len(combined_df)
 print(f"\n  Total rows after merging  :  {rows_after_merge}")
 
@@ -73,8 +70,7 @@ col_division = "5-Division"
 if col_division in combined_df.columns:
     rows_before_f1 = len(combined_df)
     combined_df    = combined_df[combined_df[col_division].str.strip() != "EB-Accessories"].reset_index(drop=True)
-    rows_after_f1  = len(combined_df)
-    removed_f1     = rows_before_f1 - rows_after_f1
+    removed_f1     = rows_before_f1 - len(combined_df)
 else:
     print(f"  ⚠ WARNING: Column '{col_division}' not found — Filter 1 skipped")
     removed_f1 = 0
@@ -85,8 +81,7 @@ if col_wh in combined_df.columns:
     rows_before_f2      = len(combined_df)
     combined_df[col_wh] = pd.to_numeric(combined_df[col_wh], errors='coerce')
     combined_df         = combined_df[combined_df[col_wh] >= 20].reset_index(drop=True)
-    rows_after_f2       = len(combined_df)
-    removed_f2          = rows_before_f2 - rows_after_f2
+    removed_f2          = rows_before_f2 - len(combined_df)
 else:
     print(f"  ⚠ WARNING: Column '{col_wh}' not found — Filter 2 skipped")
     removed_f2 = 0
@@ -97,8 +92,7 @@ if col_sizes in combined_df.columns:
     rows_before_f3         = len(combined_df)
     combined_df[col_sizes] = pd.to_numeric(combined_df[col_sizes], errors='coerce')
     combined_df            = combined_df[combined_df[col_sizes] > 2].reset_index(drop=True)
-    rows_after_f3          = len(combined_df)
-    removed_f3             = rows_before_f3 - rows_after_f3
+    removed_f3             = rows_before_f3 - len(combined_df)
 else:
     print(f"  ⚠ WARNING: Column '{col_sizes}' not found — Filter 3 skipped")
     removed_f3 = 0
@@ -110,17 +104,37 @@ if col_subclass in combined_df.columns:
     combined_df    = combined_df[
         ~combined_df[col_subclass].str.strip().str.upper().str.startswith(("BN", "BC"))
     ].reset_index(drop=True)
-    rows_after_f4  = len(combined_df)
-    removed_f4     = rows_before_f4 - rows_after_f4
+    removed_f4     = rows_before_f4 - len(combined_df)
 else:
     print(f"  ⚠ WARNING: Column '{col_subclass}' not found — Filter 4 skipped")
     removed_f4 = 0
 
-# ── STEP 9: Save final filtered CSV ───────────────────────────────────────────
+# ── STEP 9: FILTER 5 — Remove rows where '9-Season' STARTS WITH 'CORE' or 'NOS'
+# ✅ Fixed: using startswith instead of isin
+# Your data has "CORE 25", "CORE 26", "NOS-25", "NOS-26" not exact "CORE" or "NOS"
+col_season = "9-Season"
+if col_season in combined_df.columns:
+    rows_before_f5 = len(combined_df)
+
+    combined_df = combined_df[
+        ~combined_df[col_season].str.strip().str.upper().str.startswith(("CORE", "NOS"))
+    ].reset_index(drop=True)
+
+    removed_f5 = rows_before_f5 - len(combined_df)
+
+    # Show remaining Season values after filter
+    remaining_seasons = sorted(combined_df[col_season].str.strip().str.upper().unique())
+    print(f"  ✓ Filter 5 applied on '{col_season}'")
+    print(f"  ✓ Remaining Season values  :  {remaining_seasons}")
+else:
+    print(f"  ⚠ WARNING: Column '{col_season}' not found — Filter 5 skipped")
+    removed_f5 = 0
+
+# ── STEP 10: Save final filtered CSV ──────────────────────────────────────────
 combined_df.to_csv(csv_path, index=False)
 print(f"  ✓ File saved  :  {csv_path}")
 
-# ── STEP 10: Final summary ─────────────────────────────────────────────────────
+# ── STEP 11: Final summary ─────────────────────────────────────────────────────
 total_removed = rows_after_merge - len(combined_df)
 
 print(f"""
@@ -137,6 +151,7 @@ print(f"""
   ║  Filter 2 removed  (WH Stock < 20)       :  {removed_f2:<10}        ║
   ║  Filter 3 removed  (Sizes <= 2)          :  {removed_f3:<10}        ║
   ║  Filter 4 removed  (BN or BC prefix)     :  {removed_f4:<10}        ║
+  ║  Filter 5 removed  (CORE or NOS Season)  :  {removed_f5:<10}        ║
   ║  Total rows removed                      :  {total_removed:<10}        ║
   ║  Final rows in output                    :  {len(combined_df):<10}        ║
   ╠══════════════════════════════════════════════════════════════╣
