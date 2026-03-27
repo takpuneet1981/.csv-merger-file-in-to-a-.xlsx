@@ -1,0 +1,259 @@
+import pandas as pd
+from pathlib import Path
+import os
+
+# Define paths
+folder_path   = r"C:\Users\puneet.tak\Desktop\XYZ\Merge_csv"
+output_folder = r"C:\Users\puneet.tak\Desktop\XYZ"
+
+# ── Split settings — change these if column name or delimiter changes ──────────
+SPLIT_COLUMN    = "Article Style"   # exact column name to split (spaces trimmed automatically)
+SPLIT_DELIMITER = ":"               # delimiter to split on
+SPLIT_COL_1     = "Style"          # name of 1st new column — part before first :
+SPLIT_COL_2     = "Colour"         # name of 2nd new column — part between : and :
+SPLIT_COL_3     = "Size"           # name of 3rd new column — part after last :
+
+# ── AUTO-NAME: Find next available filename (x1, x2, x3...) ──────────────────
+counter = 1
+while True:
+    csv_path = os.path.join(output_folder, f"x{counter}.csv")
+    if not os.path.exists(csv_path):
+        break
+    counter += 1
+
+file_name = f"x{counter}"
+print(f"\n  Output file name selected  :  {file_name}.csv")
+print(f"  Output format             :  CSV (.csv)")
+print(f"  Output location           :  {output_folder}")
+
+# ── STEP 1: Collect all CSV files ─────────────────────────────────────────────
+print(f"\n{'='*65}")
+print(f"  STEP 1: Scanning folder for CSV files...")
+print(f"{'='*65}")
+
+csv_files = list(Path(folder_path).glob('*.csv'))
+if not csv_files:
+    print(f"  ⛔ ERROR: No CSV files found in folder: {folder_path}")
+    exit()
+
+print(f"  ✓ Folder scanned          :  {folder_path}")
+print(f"  ✓ Total CSV files found   :  {len(csv_files)}")
+for f in csv_files:
+    print(f"      → {f.name}")
+
+# ── STEP 2: Read and clean each CSV ───────────────────────────────────────────
+print(f"\n{'='*65}")
+print(f"  STEP 2: Reading and cleaning each CSV file...")
+print(f"{'='*65}")
+
+all_data    = []
+total_rows  = 0
+error_files = []
+
+for file_path in csv_files:
+    try:
+        print(f"\n  Loading: {file_path.name}")
+
+        df = pd.read_csv(
+            file_path,
+            dtype=str,
+            keep_default_na=False,
+            na_filter=False
+        )
+
+        # ✅ Strip spaces from column names to handle " Article Style" → "Article Style"
+        df.columns = df.columns.str.strip()
+
+        rows_raw = len(df)
+        print(f"    Raw rows read             :  {rows_raw}")
+        print(f"    Columns found             :  {len(df.columns)}")
+        print(f"    Column names              :  {list(df.columns)}")
+
+        # Remove second row (dotted separator line)
+        if len(df) > 1:
+            df = df.drop(index=df.index[1]).reset_index(drop=True)
+            print(f"    After removing separator  :  {len(df)} rows")
+
+        # Remove junk rows
+        junk_mask  = df.apply(
+            lambda row: row.astype(str).str.fullmatch(r'[\.\-_=\s]*').all(), axis=1
+        )
+        junk_count = junk_mask.sum()
+        df         = df[~junk_mask].reset_index(drop=True)
+
+        if junk_count > 0:
+            print(f"    Junk rows removed         :  {junk_count}")
+
+        # Add Source File column
+        df["Source File"] = file_path.name
+
+        rows_clean  = len(df)
+        total_rows += rows_clean
+        all_data.append(df)
+
+        print(f"    ✓ Clean rows loaded       :  {rows_clean}")
+        print(f"    ✓ Source File column      :  '{file_path.name}' added")
+
+    except FileNotFoundError:
+        error_files.append(file_path.name)
+        print(f"    ⛔ ERROR: File not found — {file_path.name}")
+
+    except pd.errors.EmptyDataError:
+        error_files.append(file_path.name)
+        print(f"    ⛔ ERROR: File is empty — {file_path.name}")
+
+    except pd.errors.ParserError as e:
+        error_files.append(file_path.name)
+        print(f"    ⛔ ERROR: Could not parse — {file_path.name} : {e}")
+
+    except Exception as e:
+        error_files.append(file_path.name)
+        print(f"    ⛔ ERROR: {file_path.name} — {e}")
+
+if error_files:
+    print(f"\n  ⚠ WARNING: {len(error_files)} file(s) failed to load:")
+    for f in error_files:
+        print(f"      → {f}")
+
+if not all_data:
+    print(f"\n  ⛔ FATAL ERROR: No data loaded.")
+    exit()
+
+print(f"\n  ✓ Files loaded  :  {len(all_data)} of {len(csv_files)}")
+print(f"  ✓ Total rows    :  {total_rows}")
+
+# ── STEP 3: Merge all files ────────────────────────────────────────────────────
+print(f"\n{'='*65}")
+print(f"  STEP 3: Merging all files by column name matching...")
+print(f"{'='*65}")
+
+combined_df = pd.concat(all_data, axis=0, ignore_index=True, sort=False)
+combined_df = combined_df.fillna("")
+
+print(f"  ✓ Total rows after merge   :  {len(combined_df)}")
+print(f"  ✓ Total columns            :  {len(combined_df.columns)}")
+
+# ── STEP 4: Split 'Article Style' into Style, Colour, Size ────────────────────
+print(f"\n{'='*65}")
+print(f"  STEP 4: Splitting '{SPLIT_COLUMN}' column...")
+print(f"{'='*65}")
+
+if SPLIT_COLUMN in combined_df.columns:
+
+    # Split by delimiter — max 3 parts
+    split_result = (
+        combined_df[SPLIT_COLUMN]
+        .astype(str)
+        .str.strip()
+        .str.split(SPLIT_DELIMITER, n=2, expand=True)
+    )
+
+    # ✅ Add exactly 3 new columns with correct names from Output File
+    # Column 1 — Style — part BEFORE first :
+    combined_df[SPLIT_COL_1] = split_result[0].str.strip() if 0 in split_result else ""
+
+    # Column 2 — Colour — part BETWEEN first and second :
+    combined_df[SPLIT_COL_2] = split_result[1].str.strip() if 1 in split_result else ""
+
+    # Column 3 — Size — part AFTER second :
+    combined_df[SPLIT_COL_3] = split_result[2].str.strip() if 2 in split_result else ""
+
+    print(f"  ✓ Column split            :  '{SPLIT_COLUMN}'  →  '{SPLIT_COL_1}', '{SPLIT_COL_2}', '{SPLIT_COL_3}'")
+    print(f"  ✓ Delimiter used          :  '{SPLIT_DELIMITER}'")
+    print(f"\n  Sample of split result:")
+    print(f"  {'Article Style':<30} {'Style':<15} {'Colour':<15} {'Size':<10}")
+    print(f"  {'-'*70}")
+    for _, row in combined_df[[SPLIT_COLUMN, SPLIT_COL_1, SPLIT_COL_2, SPLIT_COL_3]].head(8).iterrows():
+        print(f"  {str(row[SPLIT_COLUMN]):<30} {str(row[SPLIT_COL_1]):<15} {str(row[SPLIT_COL_2]):<15} {str(row[SPLIT_COL_3]):<10}")
+
+else:
+    print(f"  ⚠ WARNING: Column '{SPLIT_COLUMN}' not found — skipping split")
+    print(f"  Columns in data: {list(combined_df.columns)}")
+
+# ── STEP 5: Set final column order ────────────────────────────────────────────
+print(f"\n{'='*65}")
+print(f"  STEP 5: Setting final column order...")
+print(f"{'='*65}")
+
+# ✅ Final order:
+# All original columns → Source File → Style → Colour → Size
+original_cols = [c for c in combined_df.columns
+                 if c not in ["Source File", SPLIT_COL_1, SPLIT_COL_2, SPLIT_COL_3]]
+
+final_order   = original_cols + ["Source File", SPLIT_COL_1, SPLIT_COL_2, SPLIT_COL_3]
+final_order   = [c for c in final_order if c in combined_df.columns]
+combined_df   = combined_df[final_order]
+
+print(f"\n  Final column positions in output file:")
+print(f"  {'-'*50}")
+for i, col in enumerate(combined_df.columns, 1):
+    tag = ""
+    if col == "Source File":
+        tag = "  ← Source file name"
+    elif col == SPLIT_COL_1:
+        tag = f"  ← SPLIT from '{SPLIT_COLUMN}' (part 1)"
+    elif col == SPLIT_COL_2:
+        tag = f"  ← SPLIT from '{SPLIT_COLUMN}' (part 2)"
+    elif col == SPLIT_COL_3:
+        tag = f"  ← SPLIT from '{SPLIT_COLUMN}' (part 3)"
+    print(f"  {i:>3}.  {col}{tag}")
+
+# ── STEP 6: Save final CSV ─────────────────────────────────────────────────────
+print(f"\n{'='*65}")
+print(f"  STEP 6: Saving output file...")
+print(f"{'='*65}")
+
+try:
+    combined_df.to_csv(csv_path, index=False)
+
+    if os.path.exists(csv_path):
+        file_size_kb = os.path.getsize(csv_path) / 1024
+        file_size_mb = file_size_kb / 1024
+        print(f"  ✓ File saved successfully")
+        print(f"  ✓ File name    :  {file_name}.csv")
+        print(f"  ✓ File format  :  CSV (.csv)")
+        print(f"  ✓ Location     :  {csv_path}")
+        print(f"  ✓ File size    :  {file_size_mb:.2f} MB  ({file_size_kb:.0f} KB)")
+        print(f"  ✓ Rows written :  {len(combined_df)}")
+        print(f"  ✓ Cols written :  {len(combined_df.columns)}")
+    else:
+        print(f"  ⛔ ERROR: File not saved — check folder permissions")
+
+except PermissionError:
+    print(f"  ⛔ ERROR: File is open in Excel — close it and run again")
+    exit()
+
+except Exception as e:
+    print(f"  ⛔ ERROR: {e}")
+    exit()
+
+# ── FINAL SUMMARY ──────────────────────────────────────────────────────────────
+print(f"""
+  ╔══════════════════════════════════════════════════════════╗
+  ║           ✓  PROCESS COMPLETED SUCCESSFULLY              ║
+  ╠══════════════════════════════════════════════════════════╣
+  ║  File Name    →  {file_name}.csv
+  ║  Format       →  CSV (.csv)
+  ║  Location     →  {output_folder}
+  ╠══════════════════════════════════════════════════════════╣
+  ║  FILES PROCESSED                                         ║
+  ╠══════════════════════════════════════════════════════════╣
+  ║  Files found  →  {len(csv_files):<10}                          ║
+  ║  Files loaded →  {len(all_data):<10}                          ║
+  ║  Files failed →  {len(error_files):<10}                          ║
+  ╠══════════════════════════════════════════════════════════╣
+  ║  OUTPUT DETAILS                                          ║
+  ╠══════════════════════════════════════════════════════════╣
+  ║  Total Rows   →  {len(combined_df):<10}                          ║
+  ║  Total Cols   →  {len(combined_df.columns):<10}                          ║
+  ║  File Size    →  {file_size_mb:.2f} MB                          ║
+  ╠══════════════════════════════════════════════════════════╣
+  ║  SPLIT COLUMN DETAILS                                    ║
+  ╠══════════════════════════════════════════════════════════╣
+  ║  Column split →  Article Style                           ║
+  ║  Delimiter    →  :  (colon)                              ║
+  ║  New col 1    →  Style   (last col - 2)                  ║
+  ║  New col 2    →  Colour  (last col - 1)                  ║
+  ║  New col 3    →  Size    (last col)                      ║
+  ╚══════════════════════════════════════════════════════════╝
+""")
