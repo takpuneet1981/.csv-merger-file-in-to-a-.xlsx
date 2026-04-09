@@ -1,0 +1,387 @@
+import pandas as pd
+import re
+from pathlib import Path
+
+# ══════════════════════════════════════════════════════════════════════════════
+# CONFIGURATION — all paths defined here
+# ══════════════════════════════════════════════════════════════════════════════
+input_folder  = Path(r"C:\Users\puneet.tak\Desktop\XYZ\Date_Wise_VT")
+output_folder = Path(r"C:\Users\puneet.tak\Desktop\XYZ")
+
+tw_path    = input_folder / "TW_P.csv"
+sales_path = input_folder / "Sales_L7D.csv"
+
+# ── AUTO-NAME: Find next available output filename ─────────────────────────────
+counter = 1
+while True:
+    output_path = output_folder / f"Date_wise_VT_x{counter}.csv"
+    if not output_path.exists():
+        break
+    counter += 1
+
+file_name = f"Date_wise_VT_x{counter}"
+print("=" * 70)
+print(f"  Output file name selected  :  {file_name}.csv")
+print("=" * 70)
+
+# ══════════════════════════════════════════════════════════════════════════════
+# FOREIGN KEY FUNCTION
+# Removes special characters, keeps spaces, converts to UPPERCASE
+# Ensures case-insensitive matching across all files
+# ══════════════════════════════════════════════════════════════════════════════
+def clean_key(value):
+    cleaned = re.sub(r'[^a-zA-Z0-9 ]', '', str(value).strip())
+    return cleaned.upper()
+
+def make_foreign_key(df, loc_col, ag_col):
+    """Create Foreign Key by combining location + assortment group columns"""
+    return df[loc_col].apply(clean_key) + df[ag_col].apply(clean_key)
+
+# ══════════════════════════════════════════════════════════════════════════════
+# STEP 1: Load TW_P — Main file
+# Base file — all other files merged into this
+# TW_P uses: "Stock Location" + "Assortment Group" for Foreign Key
+# ══════════════════════════════════════════════════════════════════════════════
+print("\n" + "=" * 70)
+print("  STEP 1: Loading TW_P (Main File)...")
+print("-" * 70)
+
+if not tw_path.exists():
+    print(f"  ⛔ ERROR: TW_P.csv not found at {tw_path}")
+    exit()
+
+tw_df         = pd.read_csv(tw_path, dtype=str, keep_default_na=False, na_filter=False, encoding='utf-8-sig')
+tw_df.columns = tw_df.columns.str.strip()
+
+print(f"  ✓ TW_P loaded          :  {len(tw_df)} rows  |  {len(tw_df.columns)} columns")
+print(f"    Columns              :  {list(tw_df.columns)}")
+
+# Rename columns as per convention
+tw_df = tw_df.rename(columns={
+    "Total Inventory In Pipe"  : "TW-Total Inventory In Pipe",
+    "SKU Families"             : "TW-SKU Families",
+    "Valid SKU Families"       : "TW-Valid SKU Families",
+    "Newly Invalid Families"   : "TW-Newly Invalid Families",
+    "Expired Invalid Families" : "TW-Expired Invalid Families",
+    "MBQ"                      : "TW-MBQ",
+    "Total Inventory at Site"  : "TW-Total Inventory at Site",
+    "Variety Target"           : "TW-Variety Target",
+})
+
+# Drop columns not needed
+tw_df = tw_df.drop(columns=["Min Variety", "Max Variety"], errors='ignore')
+
+# Create Foreign Key for TW_P using "Stock Location" + "Assortment Group"
+tw_df["Foreign Key"] = make_foreign_key(tw_df, "Stock Location", "Assortment Group")
+
+print(f"  ✓ Columns renamed and Min/Max Variety dropped")
+print(f"  ✓ Foreign Key created  :  sample → {tw_df['Foreign Key'].iloc[0]}")
+print(f"  ✓ TW_P unique keys     :  {tw_df['Foreign Key'].nunique()}")
+
+# ══════════════════════════════════════════════════════════════════════════════
+# STEP 2: Load and merge Sales_L7D
+# Uses "Business Area" + "Product Hierarchy Description" for Foreign Key
+# Aggregates Total column by Foreign Key → becomes TW-ROS
+# ══════════════════════════════════════════════════════════════════════════════
+print("\n" + "=" * 70)
+print("  STEP 2: Loading and merging Sales_L7D...")
+print("-" * 70)
+
+if not sales_path.exists():
+    print(f"  ⛔ ERROR: Sales_L7D.csv not found at {sales_path}")
+    exit()
+
+sales_df         = pd.read_csv(sales_path, dtype=str, keep_default_na=False, na_filter=False, encoding='utf-8-sig')
+sales_df.columns = sales_df.columns.str.strip()
+
+print(f"  ✓ Sales_L7D loaded     :  {len(sales_df)} rows  |  {len(sales_df.columns)} columns")
+print(f"    Columns              :  {list(sales_df.columns)}")
+
+# Create Foreign Key for Sales
+sales_df["Foreign Key"] = make_foreign_key(
+    sales_df, "Business Area", "Product Hierarchy Description"
+)
+
+# Find Total column for ROS
+sales_val_col = None
+for col in sales_df.columns:
+    if "total" in col.lower():
+        sales_val_col = col
+        break
+if not sales_val_col:
+    sales_val_col = sales_df.columns[-1]
+    print(f"  ⚠ 'Total' not found — using last column: '{sales_val_col}'")
+
+# Aggregate by Foreign Key
+sales_df[sales_val_col] = pd.to_numeric(sales_df[sales_val_col], errors='coerce').fillna(0)
+sales_agg               = sales_df.groupby("Foreign Key", as_index=False)[sales_val_col].sum()
+sales_agg               = sales_agg.rename(columns={sales_val_col: "TW-ROS"})
+
+print(f"  ✓ Sales aggregated     :  {len(sales_agg)} unique Foreign Keys")
+
+# Check key overlap
+tw_keys    = set(tw_df["Foreign Key"])
+sales_keys = set(sales_agg["Foreign Key"])
+print(f"  ✓ TW_P ∩ Sales keys    :  {len(tw_keys & sales_keys)}")
+
+# Merge Sales into TW_P
+merged_df     = tw_df.merge(sales_agg, on="Foreign Key", how="left")
+matched_sales = merged_df["TW-ROS"].notna().sum()
+print(f"  ✓ After merging Sales  :  {len(merged_df)} rows  |  {matched_sales} rows matched")
+
+# ══════════════════════════════════════════════════════════════════════════════
+# STEP 3: Find and sort all DATE files
+# Date files have purely numeric names e.g. 02032026.csv
+# Format is DDMMYYYY — converted to YYYYMMDD for correct ascending sort
+# Date files use: "stocklocationname" + "AG Name" for Foreign Key
+# ══════════════════════════════════════════════════════════════════════════════
+print("\n" + "=" * 70)
+print("  STEP 3: Finding and sorting DATE files...")
+print("-" * 70)
+
+all_csv    = list(input_folder.glob("*.csv"))
+date_files = [f for f in all_csv if f.stem.isdigit()]
+
+if not date_files:
+    print(f"  ⚠ WARNING: No DATE files found in {input_folder}")
+else:
+    # Sort DDMMYYYY → convert to YYYYMMDD for correct chronological order
+    def sort_key(f):
+        stem = f.stem
+        if len(stem) == 8:
+            dd   = stem[0:2]
+            mm   = stem[2:4]
+            yyyy = stem[4:8]
+            return f"{yyyy}{mm}{dd}"
+        return stem
+
+    date_files = sorted(date_files, key=sort_key)
+
+    print(f"  ✓ DATE files found     :  {len(date_files)}")
+    print(f"  ✓ Sorted in ascending order:")
+    for i, f in enumerate(date_files, 1):
+        stem = f.stem
+        dd, mm, yyyy = stem[0:2], stem[2:4], stem[4:8]
+        print(f"    {i:>2}. {f.name}  →  {dd}/{mm}/{yyyy}")
+
+# ══════════════════════════════════════════════════════════════════════════════
+# STEP 4: Merge each DATE file one by one
+# Each date file uses: "stocklocationname" + "AG Name" for Foreign Key
+#   ✅ FIXED from old code — was incorrectly using "Stock Location" + "Assortment Group"
+# For each file:
+#   a) Load file
+#   b) Create Foreign Key using stocklocationname + AG Name
+#   c) Pick only ValidFamiliesSite column
+#   d) Rename to date name e.g. "02032026"
+#   e) Merge into main merged_df
+#   f) Create MIN column: MIN(TW-Variety Target, date_col) → named "02032026_A"
+# ══════════════════════════════════════════════════════════════════════════════
+print("\n" + "=" * 70)
+print("  STEP 4: Merging DATE files and creating MIN columns...")
+print("  Note: Date files use 'stocklocationname' + 'AG Name' for Foreign Key")
+print("-" * 70)
+
+date_col_pairs = []  # Tracks (date_col, min_col) pairs for column ordering
+
+for file_path in date_files:
+    date_name = file_path.stem   # e.g. "02032026"
+    min_name  = f"{date_name}_A" # e.g. "02032026_A"
+
+    print(f"\n  Processing: {file_path.name}")
+
+    try:
+        date_df         = pd.read_csv(file_path, dtype=str, keep_default_na=False, na_filter=False, encoding='utf-8-sig')
+        date_df.columns = date_df.columns.str.strip()
+
+        print(f"    Rows loaded          :  {len(date_df)}")
+
+        # ✅ FIXED: Date files use "stocklocationname" + "AG Name"
+        loc_col = "stocklocationname"
+        ag_col  = "AG Name"
+
+        if loc_col not in date_df.columns:
+            print(f"    ⛔ ERROR: '{loc_col}' not found in {file_path.name}")
+            print(f"    Columns available    :  {list(date_df.columns)}")
+            continue
+
+        if ag_col not in date_df.columns:
+            print(f"    ⛔ ERROR: '{ag_col}' not found in {file_path.name}")
+            print(f"    Columns available    :  {list(date_df.columns)}")
+            continue
+
+        if "ValidFamiliesSite" not in date_df.columns:
+            print(f"    ⛔ ERROR: 'ValidFamiliesSite' not found in {file_path.name}")
+            continue
+
+        # Create Foreign Key using stocklocationname + AG Name
+        date_df["Foreign Key"] = make_foreign_key(date_df, loc_col, ag_col)
+
+        # Sample key comparison
+        print(f"    Date FK sample       :  {date_df['Foreign Key'].iloc[0]}")
+        print(f"    TW_P FK sample       :  {merged_df['Foreign Key'].iloc[0]}")
+
+        # Keep only Foreign Key + ValidFamiliesSite
+        date_slim = date_df[["Foreign Key", "ValidFamiliesSite"]].copy()
+        date_slim = date_slim.rename(columns={"ValidFamiliesSite": date_name})
+
+        # Check key overlap before merging
+        date_keys   = set(date_df["Foreign Key"])
+        merged_keys = set(merged_df["Foreign Key"])
+        overlap     = len(merged_keys & date_keys)
+        print(f"    Keys matching TW_P   :  {overlap}")
+
+        if overlap == 0:
+            print(f"    ⚠ WARNING: 0 keys matched — check FK format")
+
+        # Merge into main dataframe
+        merged_df = merged_df.merge(date_slim, on="Foreign Key", how="left")
+
+        # Convert date column to numeric for MIN calculation
+        merged_df[date_name] = pd.to_numeric(merged_df[date_name], errors='coerce').fillna(0)
+
+        # Create MIN column: MIN(TW-Variety Target, date_column)
+        vt_numeric = pd.to_numeric(merged_df["TW-Variety Target"], errors='coerce')
+        dt_numeric = merged_df[date_name]
+
+        merged_df[min_name] = pd.DataFrame({
+            "vt": vt_numeric,
+            "dt": dt_numeric
+        }).min(axis=1)
+
+        # Round to 2 decimal places
+        merged_df[date_name] = merged_df[date_name].round(2)
+        merged_df[min_name]  = merged_df[min_name].round(2)
+
+        # Track this column pair
+        date_col_pairs.append((date_name, min_name))
+
+        matched = merged_df[date_name].notna().sum()
+        print(f"    ✓ '{date_name}' added      :  {matched} rows matched")
+        print(f"    ✓ '{min_name}' added    :  MIN(TW-Variety Target, {date_name})")
+
+    except Exception as e:
+        print(f"    ⛔ ERROR processing {file_path.name}: {e}")
+        continue
+
+# ══════════════════════════════════════════════════════════════════════════════
+# STEP 5: Arrange final column order
+# Order:
+#   1. Foreign Key
+#   2. All TW_P base columns
+#   3. TW-ROS
+#   4. Date columns in ascending date order — each date followed by its _A col
+#      e.g. 02032026, 02032026_A, 03032026, 03032026_A ...
+# ══════════════════════════════════════════════════════════════════════════════
+print("\n" + "=" * 70)
+print("  STEP 5: Arranging final column order...")
+print("-" * 70)
+
+base_columns = [
+    "Foreign Key",
+    "Stock Location",
+    "Stock Location Description",
+    "Area",
+    "Region",
+    "District",
+    "Format",
+    "Store Class",
+    "Stop Replenishment",
+    "Assortment Group",
+    "Assortment Group Description",
+    "Display Group",
+    "TW-Total Inventory In Pipe",
+    "TW-SKU Families",
+    "TW-Valid SKU Families",
+    "TW-Newly Invalid Families",
+    "TW-Expired Invalid Families",
+    "TW-MBQ",
+    "TW-Total Inventory at Site",
+    "TW-Variety Target",
+    "TW-ROS",
+]
+
+# Add date column pairs in ascending order — date col then _A col
+date_ordered_cols = []
+for date_col, min_col in date_col_pairs:
+    date_ordered_cols.append(date_col)
+    date_ordered_cols.append(min_col)
+
+# Final column list — only keep columns that exist in merged_df
+final_columns = base_columns + date_ordered_cols
+final_columns = [col for col in final_columns if col in merged_df.columns]
+merged_df     = merged_df[final_columns]
+
+print(f"  ✓ Total columns in output   :  {len(merged_df.columns)}")
+print(f"\n  Final column positions:")
+print(f"  {'-'*60}")
+for i, col in enumerate(merged_df.columns, 1):
+    tag = ""
+    if col == "TW-ROS":
+        tag = "  ← from Sales_L7D"
+    elif col.endswith("_A"):
+        tag = f"  ← MIN(TW-Variety Target, {col[:-2]})"
+    elif col.isdigit():
+        tag = f"  ← ValidFamiliesSite from {col}.csv"
+    print(f"  {i:>3}.  {col}{tag}")
+
+# ══════════════════════════════════════════════════════════════════════════════
+# STEP 6: Save final output as CSV
+# ══════════════════════════════════════════════════════════════════════════════
+print(f"\n" + "=" * 70)
+print(f"  STEP 6: Saving final output file...")
+print(f"-" * 70)
+
+try:
+    merged_df.to_csv(output_path, index=False)
+
+    if output_path.exists():
+        file_size_kb = output_path.stat().st_size / 1024
+        file_size_mb = file_size_kb / 1024
+        print(f"  ✓ File saved successfully")
+        print(f"  ✓ File name    :  {file_name}.csv")
+        print(f"  ✓ Location     :  {output_path}")
+        print(f"  ✓ File size    :  {file_size_mb:.2f} MB  ({file_size_kb:.0f} KB)")
+        print(f"  ✓ Rows written :  {len(merged_df)}")
+        print(f"  ✓ Cols written :  {len(merged_df.columns)}")
+    else:
+        print(f"  ⛔ ERROR: File not saved — check folder permissions")
+
+except PermissionError:
+    print(f"  ⛔ ERROR: File open in Excel — close it and run again")
+    exit()
+
+except Exception as e:
+    print(f"  ⛔ ERROR: {e}")
+    exit()
+
+# ══════════════════════════════════════════════════════════════════════════════
+# FINAL SUMMARY
+# ══════════════════════════════════════════════════════════════════════════════
+print(f"""
+  ╔══════════════════════════════════════════════════════════════════╗
+  ║              ✓  PROCESS COMPLETED SUCCESSFULLY                   ║
+  ╠══════════════════════════════════════════════════════════════════╣
+  ║  Output File    →  {file_name}.csv
+  ║  Input Folder   →  {str(input_folder)}
+  ║  Output Folder  →  {str(output_folder)}
+  ╠══════════════════════════════════════════════════════════════════╣
+  ║  FILES PROCESSED                                                 ║
+  ╠══════════════════════════════════════════════════════════════════╣
+  ║  TW_P rows              :  {len(tw_df):<10}                      ║
+  ║  Sales_L7D rows         :  {len(sales_df):<10}                   ║
+  ║  DATE files merged      :  {len(date_col_pairs):<10}             ║
+  ╠══════════════════════════════════════════════════════════════════╣
+  ║  FINAL OUTPUT                                                    ║
+  ╠══════════════════════════════════════════════════════════════════╣
+  ║  Final rows             :  {len(merged_df):<10}                  ║
+  ║  Final columns          :  {len(merged_df.columns):<10}          ║
+  ║  Date columns added     :  {len(date_col_pairs):<10}             ║
+  ║  MIN columns added      :  {len(date_col_pairs):<10}             ║
+  ╠══════════════════════════════════════════════════════════════════╣
+  ║  DATE FILES PROCESSED (ascending order)                          ║
+  ╠══════════════════════════════════════════════════════════════════╣""")
+
+for date_col, min_col in date_col_pairs:
+    print(f"  ║  {date_col}  →  {min_col:<50}║")
+
+print(f"  ╚══════════════════════════════════════════════════════════════════╝")
