@@ -1,0 +1,236 @@
+import pandas as pd
+from pathlib import Path
+import os
+
+# =============================================================================
+#  CONFIGURATION — Change folder paths here if needed
+# =============================================================================
+
+folder_path   = r"C:\Users\puneet.tak\Desktop\XYZ\RAW_PFR"    # Step-1: RAW_SFL → RAW_PFR
+output_folder = r"C:\Users\puneet.tak\Desktop\XYZ"
+
+# Step-5: All 5 columns to keep in the final output
+COLUMNS_TO_KEEP = [
+    "2-Family Name",
+    "8-SubClass",
+    "10-Warehouse",                                # Step-5: Newly added column
+    "20-WHSiteStkAfterAllocReplToday",
+    "30-NumofSizesatWHAfterAllocReplToday",
+]
+
+# Step-7: Duplicate check is based on the COMBINATION of both these columns
+DEDUP_KEY = ["2-Family Name", "10-Warehouse"]
+
+# =============================================================================
+#  STEP 1 — AUTO-NAME: Find the next available output filename (e.g. PFR_x1)
+# =============================================================================
+
+print("\n" + "=" * 60)
+print("  STEP 1 — Determining output file name")
+print("=" * 60)
+
+counter = 1
+while True:
+    csv_path = os.path.join(output_folder, f"PFR_x{counter}.csv")   # Step-2: PFR_ prefix added
+    if not os.path.exists(csv_path):
+        break
+    counter += 1
+
+file_name = f"PFR_x{counter}"
+print(f"  Output file name selected  :  {file_name}.csv")
+
+# =============================================================================
+#  STEP 2 — Collect all CSV files from the input folder
+# =============================================================================
+
+print("\n" + "=" * 60)
+print("  STEP 2 — Scanning input folder for CSV files")
+print("=" * 60)
+
+csv_files = list(Path(folder_path).glob("*.csv"))
+
+if not csv_files:
+    print(f"  ✗ ERROR: No CSV files found in  →  {folder_path}")
+    print("  Please check that the folder path is correct and contains .csv files.")
+    exit()
+
+print(f"  Found {len(csv_files)} CSV file(s) in folder:")
+for f in csv_files:
+    print(f"      → {f.name}")
+
+# =============================================================================
+#  STEP 3 — Read and clean each CSV file one by one
+# =============================================================================
+
+print("\n" + "=" * 60)
+print("  STEP 3 — Reading and cleaning each CSV file")
+print("=" * 60)
+
+all_data = []
+
+for file_path in csv_files:
+    try:
+        # Read entire file as strings — no auto type-conversion, no NaN replacement
+        df = pd.read_csv(
+            file_path,
+            dtype=str,
+            keep_default_na=False,
+            na_filter=False
+        )
+
+        # Strip leading/trailing spaces from all column header names
+        df.columns = df.columns.str.strip()
+
+        # Drop the second row (index 1) if the file has more than 1 row
+        # Reason: some exports include a sub-header or units row right after the header
+        if len(df) > 1:
+            df = df.drop(index=df.index[1]).reset_index(drop=True)
+
+        # Remove rows that contain only junk characters (dots, dashes, underscores, spaces)
+        junk_mask = df.apply(
+            lambda row: row.astype(str).str.fullmatch(r"[\.\-_=\s]*").all(), axis=1
+        )
+        df = df[~junk_mask].reset_index(drop=True)
+
+        all_data.append(df)
+        print(f"  ✓ {file_path.name}  →  {len(df)} rows loaded")
+
+    except Exception as e:
+        print(f"  ✗ ERROR reading file : {file_path.name}")
+        print(f"      Reason           : {e}")
+
+if not all_data:
+    print("\n  ✗ No valid data loaded from any file. Process stopped.")
+    exit()
+
+# =============================================================================
+#  STEP 4 — Merge all CSV files into one combined DataFrame
+# =============================================================================
+
+print("\n" + "=" * 60)
+print("  STEP 4 — Merging all files into one table")
+print("=" * 60)
+
+combined_df = pd.concat(all_data, ignore_index=True)
+print(f"  Total rows after merging   :  {len(combined_df)}")
+print(f"  Total columns              :  {len(combined_df.columns)}")
+
+# =============================================================================
+#  STEP 5 — Rename all column headers with sequence numbers (e.g. 1-Col, 2-Col)
+#           This is done so we can identify columns by their position number
+# =============================================================================
+
+print("\n" + "=" * 60)
+print("  STEP 5 — Renaming column headers with sequence numbers")
+print("=" * 60)
+
+combined_df.columns = [f"{i+1}-{col}" for i, col in enumerate(combined_df.columns)]
+
+print("  All renamed column headers:")
+for col in combined_df.columns:
+    print(f"      → {col}")
+
+# =============================================================================
+#  STEP 6 — Keep ONLY the 5 required columns; drop everything else
+# =============================================================================
+
+print("\n" + "=" * 60)
+print("  STEP 6 — Selecting only the 5 required columns & dropping the rest")
+print("=" * 60)
+
+# Safety check — confirm all 5 expected columns exist after renaming
+# If any column is missing, the script stops and tells you exactly which one
+missing_cols = [col for col in COLUMNS_TO_KEEP if col not in combined_df.columns]
+
+if missing_cols:
+    print("  ✗ ERROR: The following required columns were NOT found after renaming:")
+    for mc in missing_cols:
+        print(f"      → '{mc}'")
+    print()
+    print("  Possible reasons:")
+    print("    • The column exists but is at a different position in the source file")
+    print("      (which changes its sequence number prefix after renaming)")
+    print("    • The column name has a typo or extra space in the source file")
+    print()
+    print("  All available columns are printed in STEP 5 above — compare them")
+    print("  against COLUMNS_TO_KEEP at the top of this script and correct as needed.")
+    exit()
+
+# Keep only the 5 columns in the required output order
+combined_df = combined_df[COLUMNS_TO_KEEP]
+
+print(f"  Columns kept (in output order):")
+for col in combined_df.columns:
+    print(f"      → {col}")
+print(f"\n  Rows remaining after column selection  :  {len(combined_df)}")
+
+# =============================================================================
+#  STEP 7 — Remove duplicates based on the COMBINATION of:
+#               "2-Family Name"  +  "10-Warehouse"
+#
+#  What this means:
+#    • A row is a duplicate ONLY when BOTH Family Name AND Warehouse
+#      match a previously seen row at the same time
+#    • If the same Family Name appears with a DIFFERENT Warehouse → it is KEPT
+#    • All other columns (8-SubClass, etc.) may still have duplicate values — that is fine
+#    • When a duplicate is found, the FIRST occurrence is kept; the rest are dropped
+# =============================================================================
+
+print("\n" + "=" * 60)
+print("  STEP 7 — Removing duplicates on combination key:")
+print("             '2-Family Name'  +  '10-Warehouse'")
+print("=" * 60)
+
+rows_before = len(combined_df)
+
+combined_df = (
+    combined_df
+    .drop_duplicates(subset=DEDUP_KEY, keep="first")
+    .reset_index(drop=True)
+)
+
+rows_after   = len(combined_df)
+rows_removed = rows_before - rows_after
+
+print(f"  Rows before deduplication          :  {rows_before}")
+print(f"  Duplicate rows removed             :  {rows_removed}")
+print(f"  Rows after deduplication           :  {rows_after}")
+print()
+print("  Note: Only rows where BOTH '2-Family Name' AND '10-Warehouse'")
+print("        are identical are removed. All other columns are untouched.")
+
+# =============================================================================
+#  STEP 8 — Save the final output CSV file
+# =============================================================================
+
+print("\n" + "=" * 60)
+print("  STEP 8 — Saving final output file")
+print("=" * 60)
+
+combined_df.to_csv(csv_path, index=False)
+print(f"  File saved successfully  →  {csv_path}")
+
+# =============================================================================
+#  FINAL SUMMARY
+# =============================================================================
+
+print(f"""
+  ╔══════════════════════════════════════════════════════════╗
+  ║           ✓  PROCESS COMPLETED SUCCESSFULLY              ║
+  ╠══════════════════════════════════════════════════════════╣
+  ║  File Name    →  {file_name}.csv
+  ║  Location     →  {output_folder}
+  ║  Total Rows   →  {len(combined_df)}
+  ║  Total Cols   →  {len(combined_df.columns)}
+  ╠══════════════════════════════════════════════════════════╣
+  ║  Columns in output:
+  ║    1. 2-Family Name
+  ║    2. 8-SubClass
+  ║    3. 10-Warehouse
+  ║    4. 20-WHSiteStkAfterAllocReplToday
+  ║    5. 30-NumofSizesatWHAfterAllocReplToday
+  ╠══════════════════════════════════════════════════════════╣
+  ║  Duplicate removal key:
+  ║    '2-Family Name'  +  '10-Warehouse'  (combination)
+  ╚══════════════════════════════════════════════════════════╝
+""")
