@@ -1,0 +1,296 @@
+import pandas as pd
+from pathlib import Path
+import os
+ 
+# Define paths
+folder_path   = r"C:\Users\puneet.tak\Desktop\XYZ\Merge_csv"
+output_folder = r"C:\Users\puneet.tak\Desktop\XYZ"
+ 
+# ── AUTO-NAME: Find next available filename (x1, x2, x3...) ──────────────────
+counter = 1
+while True:
+    csv_path = os.path.join(output_folder, f"x{counter}.csv")
+    if not os.path.exists(csv_path):
+        break
+    counter += 1
+ 
+file_name = f"x{counter}"
+print(f"\n  Output file name selected  :  {file_name}.csv")
+print(f"  Output format             :  CSV (.csv)")
+print(f"  Output location           :  {output_folder}")
+ 
+# ── STEP 1: Collect all CSV files ─────────────────────────────────────────────
+print(f"\n{'='*65}")
+print(f"  STEP 1: Scanning folder for CSV files...")
+print(f"{'='*65}")
+ 
+csv_files = list(Path(folder_path).glob('*.csv'))
+if not csv_files:
+    print(f"  ⛔ ERROR: No CSV files found in folder: {folder_path}")
+    print(f"  Please check the folder path and try again.")
+    exit()
+ 
+print(f"  ✓ Folder scanned          :  {folder_path}")
+print(f"  ✓ Total CSV files found   :  {len(csv_files)}")
+for f in csv_files:
+    print(f"      → {f.name}")
+ 
+# ── STEP 2: Read and clean each CSV ───────────────────────────────────────────
+print(f"\n{'='*65}")
+print(f"  STEP 2: Reading and cleaning each CSV file...")
+print(f"{'='*65}")
+ 
+all_data    = []
+total_rows  = 0
+error_files = []
+ 
+for file_path in csv_files:
+    try:
+        print(f"\n  Loading: {file_path.name}")
+ 
+        df = pd.read_csv(
+            file_path,
+            dtype=str,
+            keep_default_na=False,
+            na_filter=False
+        )
+ 
+        rows_raw = len(df)
+        print(f"    Raw rows read             :  {rows_raw}")
+        print(f"    Columns found             :  {len(df.columns)}")
+        print(f"    Column names              :  {list(df.columns)}")
+ 
+        # Remove second row (dotted separator line)
+        if len(df) > 1:
+            df = df.drop(index=df.index[1]).reset_index(drop=True)
+            print(f"    After removing separator  :  {len(df)} rows")
+ 
+        # Remove junk rows
+        junk_mask  = df.apply(
+            lambda row: row.astype(str).str.fullmatch(r'[\.\-_=\s]*').all(), axis=1
+        )
+        junk_count = junk_mask.sum()
+        df         = df[~junk_mask].reset_index(drop=True)
+ 
+        if junk_count > 0:
+            print(f"    Junk rows removed         :  {junk_count}")
+ 
+        # Add source file name as last column
+        df["Source File"] = file_path.name
+ 
+        rows_clean  = len(df)
+        total_rows += rows_clean
+        all_data.append(df)
+ 
+        print(f"    ✓ Clean rows loaded       :  {rows_clean}")
+        print(f"    ✓ Source File column      :  '{file_path.name}' added to every row")
+ 
+    except FileNotFoundError:
+        error_files.append(file_path.name)
+        print(f"    ⛔ ERROR: File not found — {file_path.name}")
+ 
+    except pd.errors.EmptyDataError:
+        error_files.append(file_path.name)
+        print(f"    ⛔ ERROR: File is empty — {file_path.name}")
+ 
+    except pd.errors.ParserError as e:
+        error_files.append(file_path.name)
+        print(f"    ⛔ ERROR: Could not parse file — {file_path.name}")
+        print(f"    Details: {e}")
+ 
+    except Exception as e:
+        error_files.append(file_path.name)
+        print(f"    ⛔ ERROR: {file_path.name} — {e}")
+ 
+if error_files:
+    print(f"\n  ⚠ WARNING: {len(error_files)} file(s) could not be loaded:")
+    for f in error_files:
+        print(f"      → {f}")
+ 
+if not all_data:
+    print(f"\n  ⛔ FATAL ERROR: No data loaded — nothing to merge.")
+    exit()
+ 
+print(f"\n  ✓ Files loaded successfully :  {len(all_data)} out of {len(csv_files)}")
+print(f"  ✓ Total rows loaded         :  {total_rows}")
+ 
+# ── STEP 3: Analyse column consistency ────────────────────────────────────────
+print(f"\n{'='*65}")
+print(f"  STEP 3: Analysing column consistency across all files...")
+print(f"{'='*65}")
+ 
+all_column_sets  = [set(df.columns) for df in all_data]
+all_column_lists = [list(df.columns) for df in all_data]
+common_cols      = set.intersection(*all_column_sets)
+all_cols         = set.union(*all_column_sets)
+missing_in_some  = all_cols - common_cols
+ 
+print(f"  Total unique columns across all files  :  {len(all_cols)}")
+print(f"  Columns common in ALL files            :  {len(common_cols)}")
+print(f"  Columns missing in some files          :  {len(missing_in_some)}")
+ 
+if missing_in_some:
+    print(f"\n  ⚠ WARNING: These columns are NOT present in all files:")
+    for col in sorted(missing_in_some):
+        present_in   = [csv_files[i].name for i, cols in enumerate(all_column_sets) if col in cols]
+        missing_from = [csv_files[i].name for i, cols in enumerate(all_column_sets) if col not in cols]
+        print(f"      Column      : '{col}'")
+        print(f"      Present in  : {present_in}")
+        print(f"      Missing from: {missing_from}")
+else:
+    print(f"  ✓ All columns are consistent across all files")
+ 
+# ── STEP 4: Check column order ────────────────────────────────────────────────
+print(f"\n{'='*65}")
+print(f"  STEP 4: Checking column order consistency...")
+print(f"{'='*65}")
+ 
+reference_cols = all_column_lists[0]
+order_issues   = []
+ 
+for i, cols in enumerate(all_column_lists):
+    common_in_both = [c for c in reference_cols if c in cols]
+    actual_order   = [c for c in cols if c in reference_cols]
+    if common_in_both != actual_order:
+        order_issues.append(csv_files[i].name)
+        print(f"  ⚠ Column order mismatch in  :  {csv_files[i].name}")
+        print(f"    Expected order            :  {common_in_both}")
+        print(f"    Actual order              :  {actual_order}")
+ 
+if not order_issues:
+    print(f"  ✓ Column order is consistent across all files")
+else:
+    print(f"\n  ✓ Order mismatches will be fixed automatically during merge")
+ 
+# ── STEP 5: Merge by column name matching ─────────────────────────────────────
+print(f"\n{'='*65}")
+print(f"  STEP 5: Merging all files by column name matching...")
+print(f"{'='*65}")
+ 
+combined_df = pd.concat(all_data, axis=0, ignore_index=True, sort=False)
+combined_df = combined_df.fillna("")
+ 
+print(f"  ✓ All files merged by column name")
+print(f"  ✓ Total rows in merged data  :  {len(combined_df)}")
+print(f"  ✓ Total columns              :  {len(combined_df.columns)}")
+ 
+# ── STEP 6: Arrange final column order ────────────────────────────────────────
+print(f"\n{'='*65}")
+print(f"  STEP 6: Arranging final column order...")
+print(f"{'='*65}")
+ 
+source_col      = ["Source File"]
+reference_order = [c for c in all_column_lists[0] if c != "Source File"]
+extra_cols      = [c for c in combined_df.columns if c not in reference_order and c not in source_col]
+final_order     = reference_order + extra_cols + source_col
+final_order     = [c for c in final_order if c in combined_df.columns]
+combined_df     = combined_df[final_order]
+ 
+print(f"  ✓ Columns arranged using first file as reference")
+print(f"  ✓ Final column list          :  {list(combined_df.columns)}")
+ 
+# ── STEP 7: Remove EXACT duplicate rows ───────────────────────────────────────
+# What this does:
+#   • Compares EVERY column of one row against EVERY column of another row
+#   • Only removes a row if ALL column values match 100% — character for character
+#   • If even ONE column is different, the row is kept
+#   • The FIRST occurrence of a duplicate is always kept; the later ones are removed
+#   • The "Source File" column is also included in the comparison
+#     → meaning the same data from two different files will NOT be treated
+#       as a duplicate (since Source File values will differ)
+#   • If you want to exclude "Source File" from the comparison so that the
+#     same data row from two files IS treated as a duplicate, change the
+#     drop_duplicates line below to:
+#     subset=[c for c in combined_df.columns if c != "Source File"]
+# ─────────────────────────────────────────────────────────────────────────────
+print(f"\n{'='*65}")
+print(f"  STEP 7: Removing exact duplicate rows...")
+print(f"{'='*65}")
+print(f"  Rule  : A row is removed ONLY if ALL columns match another row exactly")
+print(f"  Action: Keep first occurrence — drop all subsequent identical rows")
+ 
+rows_before_dedup = len(combined_df)
+ 
+# Drop rows where every single column value is identical to a previous row
+combined_df = (
+    combined_df
+    .drop_duplicates(keep="first")   # No subset = checks ALL columns
+    .reset_index(drop=True)
+)
+ 
+rows_after_dedup   = len(combined_df)
+rows_removed_dedup = rows_before_dedup - rows_after_dedup
+ 
+print(f"\n  Rows before deduplication  :  {rows_before_dedup}")
+print(f"  Exact duplicate rows found :  {rows_removed_dedup}")
+print(f"  Rows after deduplication   :  {rows_after_dedup}")
+ 
+if rows_removed_dedup == 0:
+    print(f"  ✓ No exact duplicates found — all rows are unique")
+else:
+    print(f"  ✓ {rows_removed_dedup} exact duplicate row(s) removed successfully")
+ 
+# ── STEP 8: Save final merged CSV ─────────────────────────────────────────────
+print(f"\n{'='*65}")
+print(f"  STEP 8: Saving output file...")
+print(f"{'='*65}")
+ 
+try:
+    combined_df.to_csv(csv_path, index=False)
+ 
+    if os.path.exists(csv_path):
+        file_size_kb = os.path.getsize(csv_path) / 1024
+        file_size_mb = file_size_kb / 1024
+        print(f"  ✓ File saved successfully")
+        print(f"  ✓ File name              :  {file_name}.csv")
+        print(f"  ✓ File format            :  CSV (.csv)")
+        print(f"  ✓ File location          :  {csv_path}")
+        print(f"  ✓ File size              :  {file_size_mb:.2f} MB  ({file_size_kb:.0f} KB)")
+        print(f"  ✓ Rows written           :  {len(combined_df)}")
+        print(f"  ✓ Columns written        :  {len(combined_df.columns)}")
+    else:
+        print(f"  ⛔ ERROR: File was not saved — please check folder permissions")
+ 
+except PermissionError:
+    print(f"  ⛔ ERROR: Permission denied — is the file already open in Excel?")
+    print(f"  Please close the file and run again.")
+    exit()
+ 
+except Exception as e:
+    print(f"  ⛔ ERROR: Could not save file — {e}")
+    exit()
+ 
+# ── FINAL SUMMARY ──────────────────────────────────────────────────────────────
+print(f"""
+  ╔══════════════════════════════════════════════════════════╗
+  ║           ✓  PROCESS COMPLETED SUCCESSFULLY              ║
+  ╠══════════════════════════════════════════════════════════╣
+  ║  File Name      →  {file_name}.csv
+  ║  File Format    →  CSV (.csv)
+  ║  Location       →  {output_folder}
+  ╠══════════════════════════════════════════════════════════╣
+  ║  FILES PROCESSED                                         ║
+  ╠══════════════════════════════════════════════════════════╣
+  ║  Files found    →  {len(csv_files):<10}                          ║
+  ║  Files loaded   →  {len(all_data):<10}                          ║
+  ║  Files errored  →  {len(error_files):<10}                          ║
+  ╠══════════════════════════════════════════════════════════╣
+  ║  DEDUPLICATION (EXACT MATCH)                             ║
+  ╠══════════════════════════════════════════════════════════╣
+  ║  Rows before    →  {rows_before_dedup:<10}                          ║
+  ║  Duplicates     →  {rows_removed_dedup:<10}                          ║
+  ║  Rows after     →  {rows_after_dedup:<10}                          ║
+  ╠══════════════════════════════════════════════════════════╣
+  ║  OUTPUT DETAILS                                          ║
+  ╠══════════════════════════════════════════════════════════╣
+  ║  Total Rows     →  {len(combined_df):<10}                          ║
+  ║  Total Cols     →  {len(combined_df.columns):<10}                          ║
+  ║  File Size      →  {file_size_mb:.2f} MB                          ║
+  ╠══════════════════════════════════════════════════════════╣
+  ║  COLUMN HEALTH                                           ║
+  ╠══════════════════════════════════════════════════════════╣
+  ║  Common cols    →  {len(common_cols):<10}                          ║
+  ║  Missing cols   →  {len(missing_in_some):<10}                          ║
+  ║  Order fixes    →  {len(order_issues):<10}                          ║
+  ╚══════════════════════════════════════════════════════════╝
+""")
