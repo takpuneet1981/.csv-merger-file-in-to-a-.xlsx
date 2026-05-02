@@ -1,0 +1,655 @@
+import pandas as pd
+import re
+from pathlib import Path
+
+# ══════════════════════════════════════════════════════════════════════════════
+# CONFIGURATION
+# ══════════════════════════════════════════════════════════════════════════════
+input_folder  = Path(r"C:\Users\puneet.tak\Desktop\XYZ\Availability_Sales_csv")   # ← updated folder name
+output_folder = Path(r"C:\Users\puneet.tak\Desktop\XYZ")
+
+tw_path         = input_folder / "TW_P.csv"
+lw_path         = input_folder / "LW_A.csv"
+ag_path         = input_folder / "TW_A.csv"
+sales_path      = input_folder / "Sales_L7D.csv"
+
+# ── 6 NEW FILES (Step-1) ──────────────────────────────────────────────────────
+wtd_tgt_ty_path = input_folder / "WTD Target TY.csv"
+wtd_sal_ty_path = input_folder / "WTD Sales TY.csv"
+mtd_tgt_ty_path = input_folder / "MTD Target TY.csv"
+mtd_sal_ty_path = input_folder / "MTD Sales TY.csv"
+wtd_sal_ly_path = input_folder / "WTD Sales LY.csv"
+mtd_sal_ly_path = input_folder / "MTD Sales LY.csv"
+
+# ── AUTO-NAME ─────────────────────────────────────────────────────────────────
+counter = 1
+while True:
+    output_path = output_folder / f"AVL_x{counter}.csv"
+    if not output_path.exists():
+        break
+    counter += 1
+
+file_name = f"AVL_x{counter}"
+print("=" * 65)
+print(f"  Output file name selected  :  {file_name}.csv")
+print("=" * 65)
+
+# ══════════════════════════════════════════════════════════════════════════════
+# FOREIGN KEY FUNCTION
+# Removes special chars, keeps spaces, converts to UPPERCASE
+# ══════════════════════════════════════════════════════════════════════════════
+def clean_key(value):
+    cleaned = re.sub(r'[^a-zA-Z0-9 ]', '', str(value).strip())
+    return cleaned.upper()
+
+# ══════════════════════════════════════════════════════════════════════════════
+# AG COLUMN RESOLVER (Step-2 — flexible FK header)
+# The Assortment Group column may be named differently across files:
+#   "Assortment Group", "AG", or "SUB_NAME"
+# This function finds whichever one exists in a given DataFrame
+# ══════════════════════════════════════════════════════════════════════════════
+AG_ALIASES = ["Assortment Group", "AG Name", "AG", "SUB_NAME"]   # ← "AG Name" added
+
+def find_ag_column(df, file_label):
+    """Return the first AG alias column found in df, or exit with a clear error."""
+    for alias in AG_ALIASES:
+        if alias in df.columns:
+            return alias
+    print(f"\n  ⛔ ERROR: No AG column found in '{file_label}'")
+    print(f"  Looked for : {AG_ALIASES}")
+    print(f"  Found cols : {list(df.columns)}")
+    exit()
+
+# ══════════════════════════════════════════════════════════════════════════════
+# STORE LOCATION COLUMN RESOLVER
+# Location column may be "Stock Location" or "stocklocationname"
+# ══════════════════════════════════════════════════════════════════════════════
+LOC_ALIASES = ["Stock Location", "stocklocationname", "Business Area"]
+
+def find_loc_column(df, file_label):
+    """Return the first location alias column found in df, or exit with a clear error."""
+    for alias in LOC_ALIASES:
+        if alias in df.columns:
+            return alias
+    print(f"\n  ⛔ ERROR: No Location column found in '{file_label}'")
+    print(f"  Looked for : {LOC_ALIASES}")
+    print(f"  Found cols : {list(df.columns)}")
+    exit()
+
+# ══════════════════════════════════════════════════════════════════════════════
+# MATCH / REJECT REPORTER
+# Prints how many FK rows from a source file matched TW_P and how many did not
+# ══════════════════════════════════════════════════════════════════════════════
+def report_match(label, source_keys, base_keys):
+    matched  = len(source_keys & base_keys)
+    rejected = len(source_keys - base_keys)
+    total    = len(source_keys)
+    print(f"  {label:<30}  Total: {total:<6}  Matched: {matched:<6}  Rejected (no FK in TW_P): {rejected}")
+    return matched, rejected
+
+# ══════════════════════════════════════════════════════════════════════════════
+# VALUE CORRECTION MAP FOR Product Hierarchy Description
+# ══════════════════════════════════════════════════════════════════════════════
+PRODUCT_CORRECTIONS = {
+    # ── Original 8 corrections (pre-existing) ────────────────────────────────
+    'KW F Boys 2 To 8 Y Basic Plus Knit Trous'  : 'KW F BOYS 2 TO 8 Y BASIC PLUS KNIT TROUSERS',
+    'KW F Boys 2 To 8 Y Basic Plus Wvn Trouse'  : 'KW F BOYS 2 TO 8 Y BASIC PLUS WVN TROUSERS',
+    'KW F Boys 8 To 14 Y Basic Plus Knit Trou'  : 'KW F BOYS 8 TO 14 Y BASIC PLUS KNIT TROUSERS',
+    'KW F Boys 8 To 14 Y Basic Plus Wvn Trous'  : 'KW F BOYS 8 TO 14 Y BASIC PLUS WVN TROUSERS',
+    'KW F Girls 8 To 14 Y Wvn Dress 599 To 69'  : 'KW F GIRLS 8 TO 14 Y WVN DRESS 599 TO 699',
+    'MW F HS TABLE TEES'                         : 'MW F HS TABLE TEES-STRUCTURE',
+    'MW F SMART CASUAL FS SHIRTS SOLID BASIC'    : 'MW F Smart Casual FS shirts SOLID Basic plus',
+    'MW F WW CLASSIC FRML FS SHIRT SOLID BASI'   : 'MW F WW CLASSIC FRML FS SHIRT SOLID BASIC PLUS',
+    # ── NEW corrections identified from FK rejection analysis ─────────────────
+    # BC prefix in sales files maps to BN prefix in TW_P
+    'BC BOYS TEES H S 2 TO 8 Y'                 : 'BN BOYS TEES H S 2 TO 8 Y 199',
+    'BC BOYS TEES H S 8 TO 14 Y'                : 'BN BOYS TEES H S 8 TO 14 Y',
+    'BC GIRLS TEES H S 2 TO 8 Y'                : 'BN GIRLS TEES H S 2 TO 8 Y 199',
+    'BC GIRLS TEES H S 8-14 Y'                  : 'BN GIRLS TEES H S 8 TO 14 Y',
+    # SWTSHIRTS is a truncation/typo of SWEATSHIRTS
+    'KW F GIRLS 2 TO 8 Y SWTSHIRTS'             : 'KW F GIRLS 2 TO 8 Y SWEATSHIRTS',
+    'KW F GIRLS 8 TO 14 Y SWTSHIRTS'            : 'KW F GIRLS 8 TO 14 Y SWEATSHIRTS',
+    'KW F INF BOYS SWTSHIRTS'                   : 'KW F INF BOYS SWEATSHIRTS',
+    'KW F INF GIRLS SWTSHIRTS'                  : 'KW F INF GIRLS SWEATSHIRTS',
+}
+
+# ══════════════════════════════════════════════════════════════════════════════
+# STEP 1: Load ALL CSV files — original 4 + 6 new files
+# ══════════════════════════════════════════════════════════════════════════════
+print("\n" + "=" * 65)
+print("  STEP 1: Loading all CSV files...")
+print("-" * 65)
+
+# Check all files exist before loading anything
+all_files = {
+    "TW_P"          : tw_path,
+    "LW_A"          : lw_path,
+    "TW_A"          : ag_path,
+    "Sales_L7D"     : sales_path,
+    "WTD Target TY" : wtd_tgt_ty_path,
+    "WTD Sales TY"  : wtd_sal_ty_path,
+    "MTD Target TY" : mtd_tgt_ty_path,
+    "MTD Sales TY"  : mtd_sal_ty_path,
+    "WTD Sales LY"  : wtd_sal_ly_path,
+    "MTD Sales LY"  : mtd_sal_ly_path,
+}
+
+missing_files = []
+for name, path in all_files.items():
+    if not path.exists():
+        missing_files.append(f"  ⛔ MISSING: {name}  →  {path}")
+
+if missing_files:
+    print("\n  The following input files were not found:")
+    for m in missing_files:
+        print(m)
+    print("\n  Please check the input folder and file names, then try again.")
+    exit()
+
+# Load all files
+def load_csv(path, label):
+    df = pd.read_csv(path, dtype=str, keep_default_na=False, na_filter=False, encoding='utf-8-sig')
+    df.columns = df.columns.str.strip()
+    return df
+
+tw_df         = load_csv(tw_path,         "TW_P")
+lw_df         = load_csv(lw_path,         "LW_A")
+ag_df         = load_csv(ag_path,         "TW_A")
+sales_df      = load_csv(sales_path,      "Sales_L7D")
+wtd_tgt_ty_df = load_csv(wtd_tgt_ty_path, "WTD Target TY")
+wtd_sal_ty_df = load_csv(wtd_sal_ty_path, "WTD Sales TY")
+mtd_tgt_ty_df = load_csv(mtd_tgt_ty_path, "MTD Target TY")
+mtd_sal_ty_df = load_csv(mtd_sal_ty_path, "MTD Sales TY")
+wtd_sal_ly_df = load_csv(wtd_sal_ly_path, "WTD Sales LY")
+mtd_sal_ly_df = load_csv(mtd_sal_ly_path, "MTD Sales LY")
+
+# Print row counts for all files
+file_row_counts = {
+    "TW_P"          : len(tw_df),
+    "LW_A"          : len(lw_df),
+    "TW_A"          : len(ag_df),
+    "Sales_L7D"     : len(sales_df),
+    "WTD Target TY" : len(wtd_tgt_ty_df),
+    "WTD Sales TY"  : len(wtd_sal_ty_df),
+    "MTD Target TY" : len(mtd_tgt_ty_df),
+    "MTD Sales TY"  : len(mtd_sal_ty_df),
+    "WTD Sales LY"  : len(wtd_sal_ly_df),
+    "MTD Sales LY"  : len(mtd_sal_ly_df),
+}
+
+print(f"\n  {'File':<20}  {'Rows':>8}  {'Columns':>8}")
+print(f"  {'-'*20}  {'-'*8}  {'-'*8}")
+for name, df in zip(all_files.keys(),
+                    [tw_df, lw_df, ag_df, sales_df,
+                     wtd_tgt_ty_df, wtd_sal_ty_df, mtd_tgt_ty_df,
+                     mtd_sal_ty_df, wtd_sal_ly_df, mtd_sal_ly_df]):
+    print(f"  {name:<20}  {len(df):>8}  {len(df.columns):>8}")
+
+# ══════════════════════════════════════════════════════════════════════════════
+# STEP 2: Apply value corrections to ALL 7 sales/target files
+#
+# The AG column name may differ per file — we use find_ag_column() to detect
+# whichever alias is present before applying corrections.
+#
+# Files corrected:
+#   Sales_L7D, WTD Target TY, WTD Sales TY, MTD Target TY,
+#   MTD Sales TY, WTD Sales LY, MTD Sales LY
+# ══════════════════════════════════════════════════════════════════════════════
+print("\n" + "=" * 65)
+print("  STEP 2: Applying value corrections to all 7 sales/target files...")
+print("-" * 65)
+
+def apply_corrections(df, label):
+    """
+    Apply PRODUCT_CORRECTIONS to the product/AG description column of a DataFrame.
+
+    Column detection priority:
+      1. "Product Hierarchy Description"  -- used by Sales_L7D
+      2. Any alias in AG_ALIASES          -- used by the 6 new WTD/MTD files
+         ("Assortment Group", "AG Name", "AG", "SUB_NAME")
+
+    Returns (corrected_df, count_of_corrections_made).
+    """
+    # Detect which column to apply corrections to
+    if "Product Hierarchy Description" in df.columns:
+        target_col = "Product Hierarchy Description"
+    else:
+        target_col = find_ag_column(df, label)
+
+    print(f"  [{label}]  correction column  ->  '{target_col}'")
+
+    total = 0
+    for old_val, new_val in PRODUCT_CORRECTIONS.items():
+        mask  = df[target_col] == old_val
+        count = mask.sum()
+        if count > 0:
+            df.loc[mask, target_col] = new_val
+            total += count
+            print(f"  [{label}]  ✓ {count:>4} rows  '{old_val}'  →  '{new_val}'")
+    if total == 0:
+        print(f"  [{label}]  ✓ No matching values found — no corrections needed")
+    return df, total
+
+# Per-file correction counts — shown individually in the final summary
+corrections_per_file = {}
+
+sales_df,      n = apply_corrections(sales_df,      "Sales_L7D"    ); corrections_per_file["Sales_L7D"]     = n
+wtd_tgt_ty_df, n = apply_corrections(wtd_tgt_ty_df, "WTD Target TY"); corrections_per_file["WTD Target TY"] = n
+wtd_sal_ty_df, n = apply_corrections(wtd_sal_ty_df, "WTD Sales TY" ); corrections_per_file["WTD Sales TY"]  = n
+mtd_tgt_ty_df, n = apply_corrections(mtd_tgt_ty_df, "MTD Target TY"); corrections_per_file["MTD Target TY"] = n
+mtd_sal_ty_df, n = apply_corrections(mtd_sal_ty_df, "MTD Sales TY" ); corrections_per_file["MTD Sales TY"]  = n
+wtd_sal_ly_df, n = apply_corrections(wtd_sal_ly_df, "WTD Sales LY" ); corrections_per_file["WTD Sales LY"]  = n
+mtd_sal_ly_df, n = apply_corrections(mtd_sal_ly_df, "MTD Sales LY" ); corrections_per_file["MTD Sales LY"]  = n
+
+corrections_applied = sum(corrections_per_file.values())
+
+print(f"\n  Total corrections across all 7 files  :  {corrections_applied}")
+
+# ══════════════════════════════════════════════════════════════════════════════
+# STEP 3: Create Foreign Keys in ALL files
+# ── Flexible AG column: accepts "Assortment Group", "AG", or "SUB_NAME"
+# ── Flexible Location column: accepts "Stock Location", "stocklocationname",
+#    or "Business Area"
+# ══════════════════════════════════════════════════════════════════════════════
+print("\n" + "=" * 65)
+print("  STEP 3: Creating Foreign Keys in all files...")
+print("  Rule   : Remove special chars, keep spaces, UPPERCASE")
+print("  AG col : Accepts 'Assortment Group', 'AG', or 'SUB_NAME'")
+print("-" * 65)
+
+def make_fk(df, label):
+    loc_col = find_loc_column(df, label)
+    ag_col  = find_ag_column(df, label)
+    df["Foreign Key"] = df[loc_col].apply(clean_key) + df[ag_col].apply(clean_key)
+    print(f"  {label:<20}  loc='{loc_col}'  ag='{ag_col}'  FK sample: {df['Foreign Key'].iloc[0]}")
+    return df
+
+tw_df         = make_fk(tw_df,         "TW_P")
+lw_df         = make_fk(lw_df,         "LW_A")
+ag_df         = make_fk(ag_df,         "TW_A")
+wtd_tgt_ty_df = make_fk(wtd_tgt_ty_df, "WTD Target TY")
+wtd_sal_ty_df = make_fk(wtd_sal_ty_df, "WTD Sales TY")
+mtd_tgt_ty_df = make_fk(mtd_tgt_ty_df, "MTD Target TY")
+mtd_sal_ty_df = make_fk(mtd_sal_ty_df, "MTD Sales TY")
+wtd_sal_ly_df = make_fk(wtd_sal_ly_df, "WTD Sales LY")
+mtd_sal_ly_df = make_fk(mtd_sal_ly_df, "MTD Sales LY")
+
+# Sales_L7D uses Business Area + Product Hierarchy Description (unchanged)
+sales_df["Foreign Key"] = (
+    sales_df["Business Area"].apply(clean_key) +
+    sales_df["Product Hierarchy Description"].apply(clean_key)
+)
+print(f"  {'Sales_L7D':<20}  loc='Business Area'  ag='Product Hierarchy Description'  FK sample: {sales_df['Foreign Key'].iloc[0]}")
+
+# Collect unique key sets for match reporting
+tw_keys         = set(tw_df["Foreign Key"])
+lw_keys         = set(lw_df["Foreign Key"])
+ag_keys         = set(ag_df["Foreign Key"])
+sales_keys      = set(sales_df["Foreign Key"])
+wtd_tgt_ty_keys = set(wtd_tgt_ty_df["Foreign Key"])
+wtd_sal_ty_keys = set(wtd_sal_ty_df["Foreign Key"])
+mtd_tgt_ty_keys = set(mtd_tgt_ty_df["Foreign Key"])
+mtd_sal_ty_keys = set(mtd_sal_ty_df["Foreign Key"])
+wtd_sal_ly_keys = set(wtd_sal_ly_df["Foreign Key"])
+mtd_sal_ly_keys = set(mtd_sal_ly_df["Foreign Key"])
+
+print(f"\n  TW_P unique keys       :  {len(tw_keys)}  ← base for all merges")
+
+# ══════════════════════════════════════════════════════════════════════════════
+# STEP 4: Prepare TW_P — rename columns, drop unused
+# ══════════════════════════════════════════════════════════════════════════════
+print("\n" + "=" * 65)
+print("  STEP 4: Preparing TW_P (Main / Base File)...")
+print("-" * 65)
+
+tw_df = tw_df.rename(columns={
+    "Total Inventory In Pipe"  : "TW-Total Inventory In Pipe",
+    "SKU Families"             : "TW-SKU Families",
+    "Valid SKU Families"       : "TW-Valid SKU Families",
+    "Newly Invalid Families"   : "TW-Newly Invalid Families",
+    "Expired Invalid Families" : "TW-Expired Invalid Families",
+    "MBQ"                      : "TW-MBQ",
+    "Total Inventory at Site"  : "TW-Total Inventory at Site",
+    "Variety Target"           : "TW-Variety Target",
+})
+tw_df = tw_df.drop(columns=["Min Variety", "Max Variety"], errors='ignore')
+print(f"  ✓ Columns renamed and Min/Max Variety dropped")
+print(f"  ✓ TW_P total rows      :  {len(tw_df)}")
+
+# ══════════════════════════════════════════════════════════════════════════════
+# STEP 5: Prepare LW_A
+# ══════════════════════════════════════════════════════════════════════════════
+print("\n" + "=" * 65)
+print("  STEP 5: Preparing LW_A...")
+print("-" * 65)
+
+lw_df = lw_df[["Foreign Key", "ValidFamiliesSite"]].rename(columns={
+    "ValidFamiliesSite" : "LW-ValidFamiliesSite"
+})
+print(f"  ✓ LW_A columns ready   :  {list(lw_df.columns)}")
+
+# ══════════════════════════════════════════════════════════════════════════════
+# STEP 6: Prepare TW_A
+# ══════════════════════════════════════════════════════════════════════════════
+print("\n" + "=" * 65)
+print("  STEP 6: Preparing TW_A...")
+print("-" * 65)
+
+ag_df = ag_df[["Foreign Key", "ValidFamiliesSite"]].rename(columns={
+    "ValidFamiliesSite" : "TW-ValidFamiliesSite"
+})
+print(f"  ✓ TW_A columns ready   :  {list(ag_df.columns)}")
+
+# ══════════════════════════════════════════════════════════════════════════════
+# STEP 7: Prepare Sales_L7D — aggregate TW-ROS and L7D_Sales
+# ══════════════════════════════════════════════════════════════════════════════
+print("\n" + "=" * 65)
+print("  STEP 7: Preparing Sales_L7D...")
+print("-" * 65)
+
+if "Total" not in sales_df.columns:
+    print(f"  ⛔ ERROR: 'Total' column not found in Sales_L7D")
+    print(f"  Columns available: {list(sales_df.columns)}")
+    exit()
+
+has_sales_col = "Sales" in sales_df.columns
+if not has_sales_col:
+    print(f"  ⚠ WARNING: 'Sales' column not found — L7D_Sales will be skipped")
+else:
+    print(f"  ✓ 'Sales' column found — L7D_Sales will be added")
+
+sales_df["Total"] = pd.to_numeric(sales_df["Total"], errors='coerce').fillna(0)
+if has_sales_col:
+    sales_df["Sales"] = pd.to_numeric(sales_df["Sales"], errors='coerce').fillna(0)
+
+ros_agg = sales_df.groupby("Foreign Key", as_index=False)["Total"].sum()
+ros_agg = ros_agg.rename(columns={"Total": "TW-ROS"})
+
+if has_sales_col:
+    l7d_agg = sales_df.groupby("Foreign Key", as_index=False)["Sales"].sum()
+    l7d_agg = l7d_agg.rename(columns={"Sales": "L7D_Sales"})
+
+print(f"  ✓ TW-ROS aggregated    :  {len(ros_agg)} unique FK rows")
+if has_sales_col:
+    print(f"  ✓ L7D_Sales aggregated :  {len(l7d_agg)} unique FK rows")
+
+# ══════════════════════════════════════════════════════════════════════════════
+# STEP 8: Prepare 6 new sales/target files — aggregate value column
+# Each file is expected to have ONE numeric value column (besides the FK cols).
+# We auto-detect it as the first non-FK, non-location, non-AG column.
+# The aggregated column is renamed to match the file's label exactly.
+# ══════════════════════════════════════════════════════════════════════════════
+print("\n" + "=" * 65)
+print("  STEP 8: Preparing 6 new Sales / Target files...")
+print("-" * 65)
+
+def prepare_new_file(df, label):
+    """
+    Aggregate the numeric value column by Foreign Key.
+    Auto-detects the value column as the first column that is not the
+    location, AG, or Foreign Key column.
+
+    Also returns the raw loc+ag values per FK so we can fill
+    Stock Location and Assortment Group for FKs not in TW_P.
+
+    Returns a DataFrame: [Foreign Key, Stock Location, Assortment Group, <label>]
+    """
+    loc_col = find_loc_column(df, label)
+    ag_col  = find_ag_column(df, label)
+
+    skip_cols = set(LOC_ALIASES + AG_ALIASES + ["Foreign Key"])
+    value_candidates = [c for c in df.columns if c not in skip_cols]
+
+    if not value_candidates:
+        print(f"  ⛔ ERROR: No value column found in '{label}'")
+        print(f"  All columns: {list(df.columns)}")
+        exit()
+
+    value_col = value_candidates[0]
+    print(f"  {label:<20}  value col detected: '{value_col}'")
+
+    df[value_col] = pd.to_numeric(df[value_col], errors='coerce').fillna(0)
+
+    # Aggregate value by FK
+    agg = df.groupby("Foreign Key", as_index=False)[value_col].sum()
+    agg = agg.rename(columns={value_col: label})
+
+    # Also carry the raw Store and AG name for FK spine building
+    # (take first occurrence per FK — store number and AG name don't vary within a FK)
+    loc_ag = df.groupby("Foreign Key", as_index=False).agg(
+        _loc_raw=(loc_col, "first"),
+        _ag_raw=(ag_col,  "first"),
+    )
+    agg = agg.merge(loc_ag, on="Foreign Key", how="left")
+    return agg
+
+wtd_tgt_ty_agg = prepare_new_file(wtd_tgt_ty_df, "WTD Target TY")
+wtd_sal_ty_agg = prepare_new_file(wtd_sal_ty_df, "WTD Sales TY")
+mtd_tgt_ty_agg = prepare_new_file(mtd_tgt_ty_df, "MTD Target TY")
+mtd_sal_ty_agg = prepare_new_file(mtd_sal_ty_df, "MTD Sales TY")
+wtd_sal_ly_agg = prepare_new_file(wtd_sal_ly_df, "WTD Sales LY")
+mtd_sal_ly_agg = prepare_new_file(mtd_sal_ly_df, "MTD Sales LY")
+
+# ══════════════════════════════════════════════════════════════════════════════
+# STEP 9: Build the FULL FK SPINE + Merge all files
+#
+# WHAT CHANGED & WHY:
+# ─────────────────────────────────────────────────────────────────────────────
+# Previously: base = TW_P only → any FK in sales files NOT in TW_P was lost.
+#
+# Now (Steps 1–5 of the requested change):
+#   1. Collect ALL unique FKs from the 7 sales/target files.
+#   2. Build a SPINE DataFrame that contains every possible FK.
+#      For FKs that exist in TW_P   → carry all TW_P columns (Stock Location,
+#                                      Assortment Group, Area, etc.) as before.
+#      For FKs only in sales files  → Stock Location filled from Business Area,
+#                                      Assortment Group filled from SUB_NAME /
+#                                      Product Hierarchy Description.
+#                                      All other TW_P columns left blank.
+#   3. All 7 sales files are then merged onto this spine → 0 rejections for
+#      the sales columns (TW-ROS, L7D_Sales, WTD/MTD figures).
+#   4. LW_A and TW_A still merge on FK as before (they only cover TW_P FKs).
+#   5. Column order is unchanged.
+# ══════════════════════════════════════════════════════════════════════════════
+print("\n" + "=" * 65)
+print("  STEP 9: Building full FK spine and merging all files...")
+print("-" * 65)
+
+# ── 9a: Collect every FK + its raw Store & AG from the 7 sales files ─────────
+# Each prepare_new_file() result now carries _loc_raw and _ag_raw columns.
+all_sales_aggs = [
+    ros_agg, wtd_tgt_ty_agg, wtd_sal_ty_agg,
+    mtd_tgt_ty_agg, mtd_sal_ty_agg, wtd_sal_ly_agg, mtd_sal_ly_agg,
+]
+if has_sales_col:
+    all_sales_aggs.append(l7d_agg)
+
+# Build a deduplicated FK → (store, ag) lookup from all sales files
+sales_fk_lookup = pd.concat(
+    [a[["Foreign Key", "_loc_raw", "_ag_raw"]] for a in all_sales_aggs
+     if "_loc_raw" in a.columns],
+    ignore_index=True
+).drop_duplicates(subset=["Foreign Key"]).reset_index(drop=True)
+
+sales_fk_lookup = sales_fk_lookup.rename(columns={
+    "_loc_raw": "_sales_store",
+    "_ag_raw" : "_sales_ag",
+})
+
+print(f"  Unique FKs in TW_P           : {len(tw_keys)}")
+print(f"  Unique FKs across sales files: {sales_fk_lookup['Foreign Key'].nunique()}")
+
+# ── 9b: Build the spine — UNION of TW_P FKs and all sales FKs ────────────────
+# Start with TW_P as the authoritative base
+spine = tw_df.copy()
+
+# Find FKs that are in sales files but NOT in TW_P
+sales_only_fks = sales_fk_lookup[
+    ~sales_fk_lookup["Foreign Key"].isin(tw_keys)
+].copy()
+
+print(f"  FKs only in sales files      : {len(sales_only_fks)}  (new rows added to spine)")
+
+# For these new FKs, build skeleton rows:
+#   Stock Location   = Business Area (same store number)
+#   Assortment Group = SUB_NAME / Product Hierarchy Description
+#   All other TW_P columns = blank
+if len(sales_only_fks) > 0:
+    extra_rows = pd.DataFrame({
+        "Foreign Key"    : sales_only_fks["Foreign Key"].values,
+        "Stock Location" : sales_only_fks["_sales_store"].values,
+        "Assortment Group": sales_only_fks["_sales_ag"].values,
+    })
+    # All missing TW_P columns → empty string (consistent with rest of data)
+    for col in spine.columns:
+        if col not in extra_rows.columns:
+            extra_rows[col] = ""
+
+    extra_rows = extra_rows[spine.columns]   # ensure same column order
+    spine = pd.concat([spine, extra_rows], ignore_index=True)
+
+print(f"  Spine total rows (TW_P + new): {len(spine)}")
+
+# ── 9c: Merge all files onto the full spine ───────────────────────────────────
+match_stats = {}
+
+def full_merge(base, right_agg, right_keys, label, value_col):
+    """
+    Outer-friendly merge: drops internal _loc_raw/_ag_raw helper cols
+    before merging, then tracks match stats.
+    """
+    global match_stats
+    cols_to_merge = [c for c in right_agg.columns if not c.startswith("_")]
+    merged   = base.merge(right_agg[cols_to_merge], on="Foreign Key", how="left")
+    matched  = merged[value_col].replace("", pd.NA).notna().sum()
+    rejected = len(right_keys - set(spine["Foreign Key"]))   # should be 0 for sales files
+    match_stats[label] = {"rows": len(right_keys), "matched": int(matched), "rejected": rejected}
+    print(f"  ✓ {label:<22}  src_rows={len(right_keys):<6}  matched={matched:<6}  rejected={rejected}")
+    return merged
+
+merged_df = spine.copy()
+
+merged_df = full_merge(merged_df, lw_df,           lw_keys,         "LW_A",          "LW-ValidFamiliesSite")
+merged_df = full_merge(merged_df, ag_df,            ag_keys,         "TW_A",          "TW-ValidFamiliesSite")
+merged_df = full_merge(merged_df, ros_agg,          sales_keys,      "Sales_L7D ROS", "TW-ROS")
+if has_sales_col:
+    merged_df = full_merge(merged_df, l7d_agg,      sales_keys,      "Sales_L7D L7D", "L7D_Sales")
+merged_df = full_merge(merged_df, wtd_tgt_ty_agg,   wtd_tgt_ty_keys, "WTD Target TY", "WTD Target TY")
+merged_df = full_merge(merged_df, wtd_sal_ty_agg,   wtd_sal_ty_keys, "WTD Sales TY",  "WTD Sales TY")
+merged_df = full_merge(merged_df, mtd_tgt_ty_agg,   mtd_tgt_ty_keys, "MTD Target TY", "MTD Target TY")
+merged_df = full_merge(merged_df, mtd_sal_ty_agg,   mtd_sal_ty_keys, "MTD Sales TY",  "MTD Sales TY")
+merged_df = full_merge(merged_df, wtd_sal_ly_agg,   wtd_sal_ly_keys, "WTD Sales LY",  "WTD Sales LY")
+merged_df = full_merge(merged_df, mtd_sal_ly_agg,   mtd_sal_ly_keys, "MTD Sales LY",  "MTD Sales LY")
+
+# Drop the helper columns if they leaked in
+merged_df = merged_df[[c for c in merged_df.columns if not c.startswith("_")]]
+
+print(f"\n  ✓ Final merged rows    :  {len(merged_df)}")
+print(f"  ✓ Final merged columns :  {len(merged_df.columns)}")
+
+# ══════════════════════════════════════════════════════════════════════════════
+# STEP 10: Arrange final column order
+# 6 new columns added at the end, after L7D_Sales
+# ══════════════════════════════════════════════════════════════════════════════
+print("\n" + "=" * 65)
+print("  STEP 10: Arranging final column order...")
+print("-" * 65)
+
+final_columns = [
+    "Foreign Key",
+    "Stock Location",
+    "Stock Location Description",
+    "Area",
+    "Region",
+    "District",
+    "Format",
+    "Store Class",
+    "Stop Replenishment",
+    "Assortment Group",
+    "Assortment Group Description",
+    "Display Group",
+    "TW-Total Inventory In Pipe",
+    "TW-SKU Families",
+    "TW-Valid SKU Families",
+    "TW-Newly Invalid Families",
+    "TW-Expired Invalid Families",
+    "TW-MBQ",
+    "TW-Total Inventory at Site",
+    "TW-Variety Target",
+    "LW-ValidFamiliesSite",
+    "TW-ValidFamiliesSite",
+    "TW-ROS",
+    "L7D_Sales",
+    # ── 6 new columns at the end ──────────────────────────────────────────────
+    "WTD Target TY",
+    "WTD Sales TY",
+    "MTD Target TY",
+    "MTD Sales TY",
+    "WTD Sales LY",
+    "MTD Sales LY",
+]
+
+# Only keep columns that actually exist in merged_df (graceful handling)
+final_columns = [col for col in final_columns if col in merged_df.columns]
+merged_df     = merged_df[final_columns]
+
+print(f"  ✓ Final column count   :  {len(merged_df.columns)}")
+print(f"  Final column list      :  {list(merged_df.columns)}")
+
+# ══════════════════════════════════════════════════════════════════════════════
+# STEP 11: Save final output
+# ══════════════════════════════════════════════════════════════════════════════
+print("\n" + "=" * 65)
+print("  STEP 11: Saving final merged file...")
+print("-" * 65)
+
+merged_df.to_csv(output_path, index=False)
+print(f"  ✓ File saved to        :  {output_path}")
+
+# ══════════════════════════════════════════════════════════════════════════════
+# FINAL SUMMARY
+# ══════════════════════════════════════════════════════════════════════════════
+print(f"""
+  ╔══════════════════════════════════════════════════════════════╗
+  ║            ✓  PROCESS COMPLETED SUCCESSFULLY                 ║
+  ╠══════════════════════════════════════════════════════════════╣
+  ║  Output File    →  {file_name}.csv
+  ║  Input Folder   →  {str(input_folder)}
+  ╠══════════════════════════════════════════════════════════════╣
+  ║  ROW COUNT PER INPUT FILE                                    ║
+  ╠══════════════════════════════════════════════════════════════╣""")
+
+for fname, rcount in file_row_counts.items():
+    print(f"  ║  {fname:<22}  →  {rcount:<10}                   ║")
+
+print(f"""  ╠══════════════════════════════════════════════════════════════╣
+  ║  MATCH / REJECT SUMMARY (vs TW_P Foreign Keys)              ║
+  ╠══════════════════════════════════════════════════════════════╣
+  ║  {'File':<22}  {'Src Rows':>8}  {'Matched':>8}  {'Rejected':>9}  ║
+  ║  {'-'*22}  {'-'*8}  {'-'*8}  {'-'*9}  ║""")
+
+for label, stats in match_stats.items():
+    print(f"  ║  {label:<22}  {stats['rows']:>8}  {stats['matched']:>8}  {stats['rejected']:>9}  ║")
+
+print(f"""  ╠══════════════════════════════════════════════════════════════╣
+  ║  VALUE CORRECTIONS APPLIED (per file)                        ║
+  ╠══════════════════════════════════════════════════════════════╣
+  ║  {'File':<22}  {'Rows Corrected':>15}                    ║
+  ║  {'-'*22}  {'-'*15}                    ║""")
+
+for fname, cnt in corrections_per_file.items():
+    status = str(cnt) if cnt > 0 else "0  (none found)"
+    print(f"  ║  {fname:<22}  {status:>15}                    ║")
+
+print(f"""  ║  {'-'*22}  {'-'*15}                    ║
+  ║  {'TOTAL':<22}  {corrections_applied:>15}                    ║
+  ╠══════════════════════════════════════════════════════════════╣
+  ║  L7D_Sales column added         :  {'YES' if has_sales_col else 'NO -- Sales col missing'}               ║
+  ║  6 new WTD/MTD columns added    :  YES                       ║
+  ╠══════════════════════════════════════════════════════════════╣
+  ║  FINAL OUTPUT                                                ║
+  ╠══════════════════════════════════════════════════════════════╣
+  ║  Final rows                     :  {len(merged_df):<10}               ║
+  ║  Final columns                  :  {len(merged_df.columns):<10}               ║
+  ╚══════════════════════════════════════════════════════════════╝
+""")
