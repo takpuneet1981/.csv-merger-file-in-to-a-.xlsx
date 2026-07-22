@@ -1,0 +1,610 @@
+import pandas as pd
+import re
+import calendar
+from datetime import date
+from pathlib import Path
+
+# ══════════════════════════════════════════════════════════════════════════════
+# CONFIGURATION  (unchanged — same paths as before)
+# ══════════════════════════════════════════════════════════════════════════════
+input_folder  = Path(r"C:\Users\puneet.tak\Desktop\XYZ\Availability_csv")
+output_folder = Path(r"C:\Users\puneet.tak\Desktop\XYZ")
+
+tw_path    = input_folder / "TW_P.csv"
+lw_path    = input_folder / "LW_A.csv"
+ag_path    = input_folder / "TW_A.csv"
+sales_path = input_folder / "Sales_L7D.csv"
+
+# NEW: pattern for the additional historical week files.
+# Filename shape:  LW_<weeks_ago>_<date>.csv   e.g. LW_1_09july26.csv, LW_10_21july26.csv
+# The number of files is NOT hardcoded — whatever matches this pattern in the
+# folder gets picked up automatically (could be 3, 10, 20, or 52 files).
+DYNAMIC_LW_PATTERN = re.compile(r'^LW_(\d+)_(.+)\.csv$', re.IGNORECASE)
+
+# ── AUTO-NAME ─────────────────────────────────────────────────────────────────
+counter = 1
+while True:
+    output_path = output_folder / f"AVL_x{counter}.csv"
+    if not output_path.exists():
+        break
+    counter += 1
+
+file_name = f"AVL_x{counter}"
+print("=" * 65)
+print(f"  Output file name selected  :  {file_name}.csv")
+print("=" * 65)
+
+# ══════════════════════════════════════════════════════════════════════════════
+# FOREIGN KEY FUNCTION — unchanged from original
+# ══════════════════════════════════════════════════════════════════════════════
+def clean_key(value):
+    """
+    Normalise a string for use as part of a Foreign Key.
+      1. Strip leading/trailing whitespace.
+      2. Remove every character that is NOT alphanumeric or a space.
+      3. Collapse multiple consecutive spaces into one.
+      4. Convert to UPPERCASE.
+    """
+    s = str(value).strip()
+    s = re.sub(r'[^a-zA-Z0-9 ]', ' ', s)
+    s = re.sub(r' +', ' ', s)
+    return s.strip().upper()
+
+# ══════════════════════════════════════════════════════════════════════════════
+# NEW: FILENAME DATE PARSER
+# Extracts a real date out of the compact "09july26" style suffix in the
+# filename so the new columns can be ordered oldest -> newest, independent of
+# whatever number (LW_1, LW_2 ...) happens to be in the filename.
+# ══════════════════════════════════════════════════════════════════════════════
+MONTH_LOOKUP = {}
+for _i in range(1, 13):
+    MONTH_LOOKUP[calendar.month_abbr[_i].lower()] = _i   # jan, feb, mar...
+    MONTH_LOOKUP[calendar.month_name[_i].lower()] = _i   # january, february...
+
+def parse_date_from_filename(date_str):
+    """
+    Parse a compact date fragment like '09july26', '9Jul2026', '15Aug26' into
+    a datetime.date. Returns None if it cannot be confidently parsed (the file
+    is still processed and merged — it's just sorted to the end with a warning).
+    """
+    s = date_str.strip()
+    m = re.match(r'^(\d{1,2})([A-Za-z]+)(\d{2,4})$', s)
+    if not m:
+        return None
+    day_str, month_str, year_str = m.groups()
+    month_str = month_str.lower()
+    month_num = MONTH_LOOKUP.get(month_str) or MONTH_LOOKUP.get(month_str[:3])
+    if month_num is None:
+        return None
+    try:
+        day = int(day_str)
+        year = int(year_str)
+        if year < 100:
+            year += 2000
+        return date(year, month_num, day)
+    except Exception:
+        return None
+
+# ══════════════════════════════════════════════════════════════════════════════
+# PRODUCT CORRECTIONS MAP — unchanged
+# ══════════════════════════════════════════════════════════════════════════════
+PRODUCT_CORRECTIONS = {
+    'KW F Boys 2 To 8 Y Basic Plus Knit Trous'   : 'KW F BOYS 2 TO 8 Y BASIC PLUS KNIT TROUSERS',
+    'KW F Boys 2 To 8 Y Basic Plus Wvn Trouse'   : 'KW F BOYS 2 TO 8 Y BASIC PLUS WVN TROUSERS',
+    'KW F Boys 8 To 14 Y Basic Plus Knit Trou'   : 'KW F BOYS 8 TO 14 Y BASIC PLUS KNIT TROUSERS',
+    'KW F Boys 8 To 14 Y Basic Plus Wvn Trous'   : 'KW F BOYS 8 TO 14 Y BASIC PLUS WVN TROUSERS',
+    'KW F Girls 8 To 14 Y Wvn Dress 599 To 69'   : 'KW F GIRLS 8 TO 14 Y WVN DRESS 599 TO 699',
+    'MW F WW CLASSIC FRML FS SHIRT SOLID BASI'   : 'MW F WW CLASSIC FRML FS SHIRT SOLID BASIC PLUS',
+    'MW F SMART CASUAL FS SHIRTS SOLID BASIC'    : 'MW F Smart Casual FS shirts SOLID Basic plus',
+    'MW F HS TABLE TEES'                          : 'MW F HS TABLE TEES-STRUCTURE',
+    'MW F TRACK PANTS'                            : 'MW F TRACK PANTS BASIC PLUS',
+    'MW HS CREW TEES'                             : 'BN MW HS CREW TEES',
+}
+
+# ══════════════════════════════════════════════════════════════════════════════
+# STEP 1: Load core CSV files (unchanged)
+# ══════════════════════════════════════════════════════════════════════════════
+print("\n" + "=" * 65)
+print("  STEP 1: Loading all core CSV files...")
+print("-" * 65)
+
+for name, path in [("TW_P", tw_path), ("LW_A", lw_path), ("TW_A", ag_path), ("Sales_L7D", sales_path)]:
+    if not path.exists():
+        print(f"  ERROR: {name} file not found at {path}")
+        exit()
+
+tw_df    = pd.read_csv(tw_path,    dtype=str, keep_default_na=False, na_filter=False, encoding='utf-8-sig')
+lw_df    = pd.read_csv(lw_path,    dtype=str, keep_default_na=False, na_filter=False, encoding='utf-8-sig')
+ag_df    = pd.read_csv(ag_path,    dtype=str, keep_default_na=False, na_filter=False, encoding='utf-8-sig')
+sales_df = pd.read_csv(sales_path, dtype=str, keep_default_na=False, na_filter=False, encoding='utf-8-sig')
+
+tw_df.columns    = tw_df.columns.str.strip()
+lw_df.columns    = lw_df.columns.str.strip()
+ag_df.columns    = ag_df.columns.str.strip()
+sales_df.columns = sales_df.columns.str.strip()
+
+print(f"  ✓ TW_P loaded          :  {len(tw_df)} rows   |  {len(tw_df.columns)} columns")
+print(f"  ✓ LW_A loaded          :  {len(lw_df)} rows   |  {len(lw_df.columns)} columns")
+print(f"  ✓ TW_A loaded          :  {len(ag_df)} rows   |  {len(ag_df.columns)} columns")
+print(f"  ✓ Sales_L7D loaded     :  {len(sales_df)} rows   |  {len(sales_df.columns)} columns")
+
+# ══════════════════════════════════════════════════════════════════════════════
+# STEP 2: Apply value corrections to Sales_L7D (unchanged)
+# ══════════════════════════════════════════════════════════════════════════════
+print("\n" + "=" * 65)
+print("  STEP 2: Applying value corrections to Sales_L7D...")
+print("-" * 65)
+
+for col in sales_df.select_dtypes(include='object').columns:
+    sales_df[col] = sales_df[col].str.strip()
+
+corrections_applied = 0
+for old_val, new_val in PRODUCT_CORRECTIONS.items():
+    mask  = sales_df["Product Hierarchy Description"] == old_val
+    count = mask.sum()
+    if count > 0:
+        sales_df.loc[mask, "Product Hierarchy Description"] = new_val
+        corrections_applied += count
+        print(f"  ✓ Corrected {count:>5} rows  :  '{old_val}'")
+    else:
+        print(f"  ⚠ Not found            :  '{old_val}'")
+
+print(f"\n  Total rows corrected   :  {corrections_applied}")
+
+# ══════════════════════════════════════════════════════════════════════════════
+# STEP 3: Create Foreign Keys (unchanged)
+# ══════════════════════════════════════════════════════════════════════════════
+print("\n" + "=" * 65)
+print("  STEP 3: Creating Foreign Keys...")
+print("-" * 65)
+
+for col_set in [
+    (tw_df,    ["Stock Location", "Assortment Group"]),
+    (lw_df,    ["stocklocationname", "AG Name"]),
+    (ag_df,    ["stocklocationname", "AG Name"]),
+    (sales_df, ["Business Area", "Product Hierarchy Description"]),
+]:
+    df, cols = col_set
+    for col in cols:
+        df[col] = df[col].str.strip()
+
+tw_df["Foreign Key"]    = tw_df["Stock Location"].apply(clean_key)    + tw_df["Assortment Group"].apply(clean_key)
+lw_df["Foreign Key"]    = lw_df["stocklocationname"].apply(clean_key) + lw_df["AG Name"].apply(clean_key)
+ag_df["Foreign Key"]    = ag_df["stocklocationname"].apply(clean_key) + ag_df["AG Name"].apply(clean_key)
+sales_df["Foreign Key"] = sales_df["Business Area"].apply(clean_key)  + sales_df["Product Hierarchy Description"].apply(clean_key)
+
+tw_keys    = set(tw_df["Foreign Key"])
+lw_keys    = set(lw_df["Foreign Key"])
+ag_keys    = set(ag_df["Foreign Key"])
+sales_keys = set(sales_df["Foreign Key"])
+
+print(f"  TW_P unique keys       :  {len(tw_keys)}")
+print(f"  LW_A unique keys       :  {len(lw_keys)}")
+print(f"  TW_A unique keys       :  {len(ag_keys)}")
+print(f"  Sales unique keys      :  {len(sales_keys)}")
+print(f"  TW_P ∩ LW_A            :  {len(tw_keys & lw_keys)}")
+print(f"  TW_P ∩ TW_A            :  {len(tw_keys & ag_keys)}")
+print(f"  TW_P ∩ Sales           :  {len(tw_keys & sales_keys)}")
+
+# ══════════════════════════════════════════════════════════════════════════════
+# STEP 4: Prepare TW_P (unchanged)
+# ══════════════════════════════════════════════════════════════════════════════
+print("\n" + "=" * 65)
+print("  STEP 4: Preparing TW_P (Main File)...")
+print("-" * 65)
+
+tw_df = tw_df.rename(columns={
+    "Total Inventory In Pipe"  : "TW-Total Inventory In Pipe",
+    "SKU Families"             : "TW-SKU Families",
+    "Valid SKU Families"       : "TW-Valid SKU Families",
+    "Newly Invalid Families"   : "TW-Newly Invalid Families",
+    "Expired Invalid Families" : "TW-Expired Invalid Families",
+    "MBQ"                      : "TW-MBQ",
+    "Total Inventory at Site"  : "TW-Total Inventory at Site",
+    "Variety Target"           : "TW-Variety Target",
+})
+tw_df = tw_df.drop(columns=["Min Variety", "Max Variety"], errors='ignore')
+print(f"  ✓ Columns renamed and Min/Max Variety dropped")
+print(f"  ✓ TW_P total rows      :  {len(tw_df)}")
+
+# ══════════════════════════════════════════════════════════════════════════════
+# STEP 5: Prepare LW_A (unchanged)
+# ══════════════════════════════════════════════════════════════════════════════
+print("\n" + "=" * 65)
+print("  STEP 5: Preparing LW_A File...")
+print("-" * 65)
+
+lw_df = lw_df[["Foreign Key", "ValidFamiliesSite"]].rename(columns={"ValidFamiliesSite": "LW-ValidFamiliesSite"})
+dupes_lw = lw_df.duplicated("Foreign Key").sum()
+if dupes_lw > 0:
+    print(f"  ⚠ Duplicate FKs in LW_A  :  {dupes_lw}  → keeping last occurrence")
+    lw_df = lw_df.drop_duplicates("Foreign Key", keep="last")
+print(f"  ✓ LW_A rows after dedup :  {len(lw_df)}")
+
+# ══════════════════════════════════════════════════════════════════════════════
+# STEP 6: Prepare TW_A (unchanged)
+# ══════════════════════════════════════════════════════════════════════════════
+print("\n" + "=" * 65)
+print("  STEP 6: Preparing TW_A File...")
+print("-" * 65)
+
+ag_df = ag_df[["Foreign Key", "ValidFamiliesSite"]].rename(columns={"ValidFamiliesSite": "TW-ValidFamiliesSite"})
+dupes_ag = ag_df.duplicated("Foreign Key").sum()
+if dupes_ag > 0:
+    print(f"  ⚠ Duplicate FKs in TW_A  :  {dupes_ag}  → keeping last occurrence")
+    ag_df = ag_df.drop_duplicates("Foreign Key", keep="last")
+print(f"  ✓ TW_A rows after dedup :  {len(ag_df)}")
+
+# ══════════════════════════════════════════════════════════════════════════════
+# STEP 7: Prepare Sales_L7D (unchanged)
+# ══════════════════════════════════════════════════════════════════════════════
+print("\n" + "=" * 65)
+print("  STEP 7: Preparing Sales_L7D...")
+print("-" * 65)
+
+if "Total" not in sales_df.columns:
+    print(f"  ⛔ ERROR: 'Total' column not found in Sales_L7D")
+    exit()
+
+has_sales_col = "Sales" in sales_df.columns
+sales_df["Total"] = pd.to_numeric(sales_df["Total"], errors='coerce').fillna(0)
+if has_sales_col:
+    sales_df["Sales"] = pd.to_numeric(sales_df["Sales"], errors='coerce').fillna(0)
+
+ros_agg = sales_df.groupby("Foreign Key", as_index=False)["Total"].sum().rename(columns={"Total": "TW-ROS"})
+if has_sales_col:
+    l7d_agg = sales_df.groupby("Foreign Key", as_index=False)["Sales"].sum().rename(columns={"Sales": "L7D_Sales"})
+
+print(f"  ✓ TW-ROS unique FK      :  {len(ros_agg)}")
+if has_sales_col:
+    print(f"  ✓ L7D_Sales unique FK   :  {len(l7d_agg)}")
+
+# ══════════════════════════════════════════════════════════════════════════════
+# STEP 8: Merge core files on Foreign Key (unchanged)
+# ══════════════════════════════════════════════════════════════════════════════
+print("\n" + "=" * 65)
+print("  STEP 8: Merging core files on Foreign Key...")
+print("-" * 65)
+
+merged_df = tw_df.copy()
+print(f"  Starting with TW_P     :  {len(merged_df)} rows")
+
+merged_df  = merged_df.merge(lw_df, on="Foreign Key", how="left")
+matched_lw = merged_df["LW-ValidFamiliesSite"].replace("", pd.NA).notna().sum()
+print(f"  After merging LW_A     :  {len(merged_df)} rows  |  {matched_lw} matched")
+
+merged_df  = merged_df.merge(ag_df, on="Foreign Key", how="left")
+matched_ag = merged_df["TW-ValidFamiliesSite"].replace("", pd.NA).notna().sum()
+print(f"  After merging TW_A     :  {len(merged_df)} rows  |  {matched_ag} matched")
+
+merged_df   = merged_df.merge(ros_agg, on="Foreign Key", how="left")
+matched_ros = merged_df["TW-ROS"].notna().sum()
+print(f"  After merging TW-ROS   :  {len(merged_df)} rows  |  {matched_ros} matched  ({matched_ros/len(merged_df)*100:.1f}%)")
+
+if has_sales_col:
+    merged_df   = merged_df.merge(l7d_agg, on="Foreign Key", how="left")
+    matched_l7d = merged_df["L7D_Sales"].notna().sum()
+    print(f"  After merging L7D_Sales:  {len(merged_df)} rows  |  {matched_l7d} matched  ({matched_l7d/len(merged_df)*100:.1f}%)")
+
+# ══════════════════════════════════════════════════════════════════════════════
+# STEP 8B  ── NEW ──
+# Discover, process and merge every dynamic "LW_<n>_<date>.csv" file found in
+# the input folder. Same Foreign Key logic, same dedup logic, same left-merge
+# logic as LW_A / TW_A above — nothing about the matching rules changes.
+# ══════════════════════════════════════════════════════════════════════════════
+print("\n" + "=" * 65)
+print("  STEP 8B: Discovering historical 'LW_x' week files...")
+print("-" * 65)
+
+candidate_files = sorted(input_folder.glob("LW_*_*.csv"))
+dynamic_files = []
+for f in candidate_files:
+    m = DYNAMIC_LW_PATTERN.match(f.name)
+    if not m:
+        continue
+    week_num  = int(m.group(1))
+    date_str  = m.group(2)
+    parsed    = parse_date_from_filename(date_str)
+    dynamic_files.append({
+        "path": f, "filename": f.name, "stem": f.stem,
+        "week_num": week_num, "date_str": date_str, "parsed_date": parsed,
+    })
+
+print(f"  Found {len(dynamic_files)} file(s) matching pattern 'LW_<n>_<date>.csv'")
+
+with_date    = [d for d in dynamic_files if d["parsed_date"] is not None]
+without_date = [d for d in dynamic_files if d["parsed_date"] is None]
+with_date.sort(key=lambda d: (d["parsed_date"], d["week_num"]))
+without_date.sort(key=lambda d: d["week_num"])
+
+if without_date:
+    print(f"  ⚠ {len(without_date)} file(s) had an unparseable date suffix — "
+          f"these are still merged but pushed to the end of the column order:")
+    for d in without_date:
+        print(f"      - {d['filename']}  (raw date fragment: '{d['date_str']}')")
+
+ordered_files = with_date + without_date
+
+print("\n  Merge order (oldest → newest, by parsed filename date):")
+for i, d in enumerate(ordered_files, start=1):
+    date_disp = d["parsed_date"].isoformat() if d["parsed_date"] else "UNPARSED"
+    print(f"    {i:>2}. {d['filename']:<28}  weeks_ago=LW_{d['week_num']:<3}  date={date_disp}")
+
+print("\n" + "-" * 65)
+print("  STEP 8B: Processing & merging each historical file...")
+print("-" * 65)
+
+def find_variety_target_col(columns):
+    """
+    Flexible lookup for the Variety Target column in a historical LW_x file.
+    Matches regardless of spacing/underscores/case, e.g. 'VarietyTarget',
+    'Variety Target', 'variety_target' all resolve to the same source column.
+    """
+    for c in columns:
+        if re.sub(r'[^a-z0-9]', '', c.lower()) == 'varietytarget':
+            return c
+    return None
+
+def find_valid_families_pipe_col(columns):
+    """
+    Flexible lookup for the ValidFamiliesPipe column in a historical LW_x file.
+    Matches regardless of spacing/underscores/case, e.g. 'ValidFamiliesPipe',
+    'Valid Families Pipe', 'valid_families_pipe' all resolve to the same
+    source column.
+    """
+    for c in columns:
+        if re.sub(r'[^a-z0-9]', '', c.lower()) == 'validfamiliespipe':
+            return c
+    return None
+
+new_columns_order      = []   # ValidFamiliesSite-per-week columns (as before)
+variety_columns_order  = []   # VarietyTarget-per-week columns
+pipe_columns_order     = []   # NEW: ValidFamiliesPipe-per-week columns
+file_stats = []
+used_col_names = set(merged_df.columns)
+
+for idx, d in enumerate(ordered_files, start=1):
+    fname, fpath, stem, date_str = d["filename"], d["path"], d["stem"], d["date_str"]
+    print(f"\n  [{idx}/{len(ordered_files)}] Processing: {fname}")
+
+    try:
+        df = pd.read_csv(fpath, dtype=str, keep_default_na=False, na_filter=False, encoding='utf-8-sig')
+        df.columns = df.columns.str.strip()
+
+        required_cols = ["stocklocationname", "AG Name", "ValidFamiliesSite"]
+        missing = [c for c in required_cols if c not in df.columns]
+        if missing:
+            print(f"        ⛔ SKIPPED — missing required column(s): {missing}")
+            file_stats.append({"file": fname, "status": "FAILED",
+                                "reason": f"missing columns {missing}",
+                                "rows_loaded": len(df), "matched": 0, "match_pct": 0.0,
+                                "vt_found": False, "vt_matched": 0, "vt_match_pct": 0.0,
+                                "vfp_found": False, "vfp_matched": 0, "vfp_match_pct": 0.0})
+            continue
+
+        # Locate the VarietyTarget column (optional — file still processes for
+        # ValidFamiliesSite even if this isn't present, just logs a warning)
+        vt_source_col = find_variety_target_col(df.columns)
+        if vt_source_col is None:
+            print(f"        ⚠ 'VarietyTarget' column not found in this file — "
+                  f"varietytarget_{date_str} will be skipped for this file")
+
+        # NEW: locate the ValidFamiliesPipe column (same optional handling)
+        vfp_source_col = find_valid_families_pipe_col(df.columns)
+        if vfp_source_col is None:
+            print(f"        ⚠ 'ValidFamiliesPipe' column not found in this file — "
+                  f"validFamiliesPipe_{date_str} will be skipped for this file")
+
+        rows_loaded = len(df)
+        for col in required_cols:
+            df[col] = df[col].str.strip()
+        if vt_source_col:
+            df[vt_source_col] = df[vt_source_col].str.strip()
+        if vfp_source_col:
+            df[vfp_source_col] = df[vfp_source_col].str.strip()
+
+        df["Foreign Key"] = df["stocklocationname"].apply(clean_key) + df["AG Name"].apply(clean_key)
+
+        dupes = df.duplicated("Foreign Key").sum()
+        if dupes > 0:
+            df = df.drop_duplicates("Foreign Key", keep="last")
+
+        col_name = stem
+        if col_name in used_col_names:
+            col_name = f"{stem}_dup"
+            print(f"        ⚠ Column name collision — using '{col_name}' instead")
+        used_col_names.add(col_name)
+
+        # Build the varietytarget_<date> column name (header format required:
+        # 'varietytarget' + '_' + the date exactly as it appears in the filename)
+        vt_col_name = None
+        if vt_source_col:
+            vt_col_name = f"varietytarget_{date_str}"
+            if vt_col_name in used_col_names:
+                vt_col_name = f"varietytarget_{date_str}_dup"
+                print(f"        ⚠ Column name collision — using '{vt_col_name}' instead")
+            used_col_names.add(vt_col_name)
+
+        # NEW: build the validFamiliesPipe_<date> column name (header format
+        # required: 'validFamiliesPipe' + '_' + the date exactly as it appears
+        # in the filename)
+        vfp_col_name = None
+        if vfp_source_col:
+            vfp_col_name = f"validFamiliesPipe_{date_str}"
+            if vfp_col_name in used_col_names:
+                vfp_col_name = f"validFamiliesPipe_{date_str}_dup"
+                print(f"        ⚠ Column name collision — using '{vfp_col_name}' instead")
+            used_col_names.add(vfp_col_name)
+
+        keep_cols  = ["Foreign Key", "ValidFamiliesSite"]
+        rename_map = {"ValidFamiliesSite": col_name}
+        if vt_source_col:
+            keep_cols.append(vt_source_col)
+            rename_map[vt_source_col] = vt_col_name
+        if vfp_source_col:
+            keep_cols.append(vfp_source_col)
+            rename_map[vfp_source_col] = vfp_col_name
+        df = df[keep_cols].rename(columns=rename_map)
+
+        merged_df = merged_df.merge(df, on="Foreign Key", how="left")
+
+        matched   = merged_df[col_name].replace("", pd.NA).notna().sum()
+        match_pct = (matched / len(merged_df) * 100) if len(merged_df) > 0 else 0.0
+
+        vt_matched, vt_match_pct = 0, 0.0
+        if vt_col_name:
+            vt_matched   = merged_df[vt_col_name].replace("", pd.NA).notna().sum()
+            vt_match_pct = (vt_matched / len(merged_df) * 100) if len(merged_df) > 0 else 0.0
+
+        vfp_matched, vfp_match_pct = 0, 0.0
+        if vfp_col_name:
+            vfp_matched   = merged_df[vfp_col_name].replace("", pd.NA).notna().sum()
+            vfp_match_pct = (vfp_matched / len(merged_df) * 100) if len(merged_df) > 0 else 0.0
+
+        print(f"        ✓ rows_loaded={rows_loaded}  |  duplicate_FKs_removed={dupes}  "
+              f"|  {col_name} matched={matched}/{len(merged_df)} ({match_pct:.1f}%)")
+        if vt_col_name:
+            print(f"        ✓ {vt_col_name} matched={vt_matched}/{len(merged_df)} ({vt_match_pct:.1f}%)")
+        if vfp_col_name:
+            print(f"        ✓ {vfp_col_name} matched={vfp_matched}/{len(merged_df)} ({vfp_match_pct:.1f}%)")
+
+        new_columns_order.append(col_name)
+        if vt_col_name:
+            variety_columns_order.append(vt_col_name)
+        if vfp_col_name:
+            pipe_columns_order.append(vfp_col_name)
+
+        file_stats.append({"file": fname, "status": "SUCCESS", "reason": "",
+                            "rows_loaded": rows_loaded, "matched": int(matched), "match_pct": match_pct,
+                            "vt_found": vt_source_col is not None,
+                            "vt_matched": int(vt_matched), "vt_match_pct": vt_match_pct,
+                            "vfp_found": vfp_source_col is not None,
+                            "vfp_matched": int(vfp_matched), "vfp_match_pct": vfp_match_pct})
+
+    except Exception as e:
+        print(f"        ⛔ ERROR while processing {fname}: {e}")
+        file_stats.append({"file": fname, "status": "FAILED", "reason": str(e),
+                            "rows_loaded": 0, "matched": 0, "match_pct": 0.0,
+                            "vt_found": False, "vt_matched": 0, "vt_match_pct": 0.0,
+                            "vfp_found": False, "vfp_matched": 0, "vfp_match_pct": 0.0})
+
+# ══════════════════════════════════════════════════════════════════════════════
+# STEP 9: Arrange final column order
+# Original columns kept in their EXACT original order. New per-week columns are
+# appended at the very end, oldest -> newest (already in that order because we
+# processed/merged them in that sequence above).
+# ══════════════════════════════════════════════════════════════════════════════
+print("\n" + "=" * 65)
+print("  STEP 9: Arranging final column order...")
+print("-" * 65)
+
+final_columns = [
+    "Foreign Key",
+    "Stock Location",
+    "Stock Location Description",
+    "Area",
+    "Region",
+    "District",
+    "Format",
+    "Store Class",
+    "Stop Replenishment",
+    "Assortment Group",
+    "Assortment Group Description",
+    "Display Group",
+    "TW-Total Inventory In Pipe",
+    "TW-SKU Families",
+    "TW-Valid SKU Families",
+    "TW-Newly Invalid Families",
+    "TW-Expired Invalid Families",
+    "TW-MBQ",
+    "TW-Total Inventory at Site",
+    "TW-Variety Target",
+    "LW-ValidFamiliesSite",
+    "TW-ValidFamiliesSite",
+    "TW-ROS",
+    "L7D_Sales",
+]
+
+final_columns = [col for col in final_columns if col in merged_df.columns]
+# Order of appended blocks (each block internally oldest -> newest):
+#   1. original columns (untouched)
+#   2. per-week ValidFamiliesSite columns      (LW_1_09july26, LW_2_02july26, ...)
+#   3. per-week VarietyTarget columns          (varietytarget_09july26, ...)
+#   4. per-week ValidFamiliesPipe columns  NEW (validFamiliesPipe_09july26, ...)
+final_columns = final_columns + new_columns_order + variety_columns_order + pipe_columns_order
+merged_df     = merged_df[final_columns]
+
+original_count = len(final_columns) - len(new_columns_order) - len(variety_columns_order) - len(pipe_columns_order)
+print(f"  ✓ Original column count       :  {original_count}")
+print(f"  ✓ New ValidFamiliesSite cols  :  {len(new_columns_order)}  -> {new_columns_order}")
+print(f"  ✓ New VarietyTarget cols      :  {len(variety_columns_order)}  -> {variety_columns_order}")
+print(f"  ✓ New ValidFamiliesPipe cols  :  {len(pipe_columns_order)}  -> {pipe_columns_order}")
+print(f"  ✓ Final column count          :  {len(merged_df.columns)}")
+
+# ══════════════════════════════════════════════════════════════════════════════
+# STEP 10: Save final output (unchanged)
+# ══════════════════════════════════════════════════════════════════════════════
+print("\n" + "=" * 65)
+print("  STEP 10: Saving final merged file...")
+print("-" * 65)
+
+merged_df.to_csv(output_path, index=False)
+print(f"  ✓ File saved to        :  {output_path}")
+
+# ══════════════════════════════════════════════════════════════════════════════
+# FINAL SUMMARY
+# ══════════════════════════════════════════════════════════════════════════════
+ros_pct = matched_ros / len(merged_df) * 100 if len(merged_df) > 0 else 0
+l7d_pct = matched_l7d / len(merged_df) * 100 if has_sales_col and len(merged_df) > 0 else 0
+
+total_dyn   = len(file_stats)
+success_dyn = len([s for s in file_stats if s["status"] == "SUCCESS"])
+failed_dyn  = total_dyn - success_dyn
+success_pct = (success_dyn / total_dyn * 100) if total_dyn > 0 else 0.0
+
+print(f"""
+  ╔══════════════════════════════════════════════════════════════╗
+  ║            ✓  PROCESS COMPLETED SUCCESSFULLY                 ║
+  ╠══════════════════════════════════════════════════════════════╣
+  ║  Output File    →  {file_name}.csv
+  ╠══════════════════════════════════════════════════════════════╣
+  ║  CORE FILE MATCH SUMMARY                                     ║
+  ╠══════════════════════════════════════════════════════════════╣
+  ║  TW_P keys matching LW_A     :  {len(tw_keys & lw_keys):<10} ║
+  ║  TW_P keys matching TW_A     :  {len(tw_keys & ag_keys):<10} ║
+  ║  TW_P keys matching Sales    :  {len(tw_keys & sales_keys):<10} ║
+  ║  TW-ROS match rate           :  {ros_pct:<6.1f}%             ║
+  ║  L7D_Sales match rate        :  {l7d_pct:<6.1f}%             ║
+  ╠══════════════════════════════════════════════════════════════╣
+  ║  HISTORICAL 'LW_x' FILES SUMMARY                             ║
+  ╠══════════════════════════════════════════════════════════════╣
+  ║  Files discovered            :  {total_dyn:<10}              ║
+  ║  Files merged successfully   :  {success_dyn:<10}             ║
+  ║  Files failed / skipped      :  {failed_dyn:<10}             ║
+  ║  Success rate                :  {success_pct:<6.1f}%          ║
+  ╠══════════════════════════════════════════════════════════════╣
+  ║  FINAL OUTPUT                                                ║
+  ╠══════════════════════════════════════════════════════════════╣
+  ║  Final rows                  :  {len(merged_df):<10}         ║
+  ║  Final columns               :  {len(merged_df.columns):<10} ║
+  ╚══════════════════════════════════════════════════════════════╝
+""")
+
+print("  Per-file breakdown (historical LW_x files):")
+print("  " + "-" * 140)
+print(f"  {'File':<24} {'Status':<9} {'Rows':<6} {'ValidFam Matched':<18} {'VT Found':<9} {'VT Matched':<14} {'VFP Found':<10} {'VFP Matched':<14} Notes")
+print("  " + "-" * 140)
+for s in file_stats:
+    note      = s["reason"] if s["status"] == "FAILED" else ""
+    vfam_disp = f"{s['matched']} ({s['match_pct']:.1f}%)"
+    vt_found  = "Yes" if s.get("vt_found") else "No"
+    vt_disp   = f"{s['vt_matched']} ({s['vt_match_pct']:.1f}%)" if s.get("vt_found") else "-"
+    vfp_found = "Yes" if s.get("vfp_found") else "No"
+    vfp_disp  = f"{s['vfp_matched']} ({s['vfp_match_pct']:.1f}%)" if s.get("vfp_found") else "-"
+    print(f"  {s['file']:<24} {s['status']:<9} {s['rows_loaded']:<6} {vfam_disp:<18} {vt_found:<9} {vt_disp:<14} {vfp_found:<10} {vfp_disp:<14} {note}")
+print("  " + "-" * 140)
+
+vt_found_count  = len([s for s in file_stats if s.get("vt_found")])
+vfp_found_count = len([s for s in file_stats if s.get("vfp_found")])
+print(f"\n  VarietyTarget column found in {vt_found_count}/{len(file_stats)} historical file(s) processed.")
+print(f"  ValidFamiliesPipe column found in {vfp_found_count}/{len(file_stats)} historical file(s) processed.")
