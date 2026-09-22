@@ -3,8 +3,8 @@ from pathlib import Path
 import os
 
 # Define paths
-folder_path   = r"C:\Users\puneet.tak\Desktop\XYZ\Merge_csv"
-output_folder = r"C:\Users\puneet.tak\Desktop\XYZ"
+folder_path   = r"E:\puneet-onedrive\XYZ\Merge_csv"
+output_folder = r"E:\puneet-onedrive\XYZ"
 
 # ── AUTO-NAME: Find next available filename (x1, x2, x3...) ──────────────────
 counter = 1
