@@ -1,0 +1,1126 @@
+r"""
+================================================================================
+ACCESSORIES AUTO-REPLENISHMENT PIPELINE — SINGLE-FILE VERSION
+================================================================================
+Input folder : E:\puneet-onedrive\XYZ\Acc\Input files   (flat; files found by name prefix)
+Output folder: E:\puneet-onedrive\XYZ\Acc\Output files  (every file suffixed with run date)
+Run:  python accessories_replenishment_pipeline.py
+================================================================================
+"""
+
+import os
+import re
+import glob
+import zipfile
+import tempfile
+import time
+import numpy as np
+import pandas as pd
+
+
+
+# ============================================================================
+# SECTION: CONFIG
+# ============================================================================
+"""
+Config for the Accessories Auto-Replenishment Pipeline.
+Every business rule that could plausibly change lives here, not buried in logic.
+"""
+
+
+# ---------------------------------------------------------------------------
+# PATHS  (fixed folder locations, as agreed)
+# ---------------------------------------------------------------------------
+INPUT_DIR = r"E:\puneet-onedrive\XYZ\Acc\Input files"
+OUTPUT_DIR = r"E:\puneet-onedrive\XYZ\Acc\Output files"
+
+# All input files (SOH region files AND Input-2..6) sit directly in INPUT_DIR
+# -- no subfolder. Each is located by matching the START of its filename
+# (case-insensitive), since the exact date suffix changes daily for SOH, and
+# to be tolerant of minor trailing-text changes for Input-2..6.
+SOH_FILE_PREFIX = "SOH"
+INPUT2_FILE_PREFIX = "Input-2"   # e.g. "Input-2 VT MBQ.xlsx"
+INPUT3_FILE_PREFIX = "Input-3"   # e.g. "Input-3 AG Rank.xlsx"
+INPUT4_FILE_PREFIX = "Input-4"   # e.g. "Input-4 Store Rank.xlsx"
+INPUT5_FILE_PREFIX = "Input-5"   # e.g. "Input-5 Cond.xlsx"
+INPUT6_FILE_PREFIX = "Input-6"   # e.g. "Input-6 Sales.xlsx"
+
+
+def get_output_paths(run_date=None, output_dir=None):
+    """Every output filename gets a run-date suffix (default: today), so
+    each day's run is clearly identifiable and never silently overwrites a
+    previous day's output unless run twice on the same day."""
+    date_str = run_date or time.strftime("%Y%m%d")
+    out = output_dir or OUTPUT_DIR
+    return {
+        "output1": os.path.join(out, f"Output1_Replenishment_Order_File_{date_str}.xlsx"),
+        "output2": os.path.join(out, f"Output2_Store_AG_Gap_Report_{date_str}.xlsx"),
+        "run_log": os.path.join(out, f"Run_Log_{date_str}.txt"),
+        "exceptions": os.path.join(out, f"Exceptions_Report_{date_str}.xlsx"),
+    }
+
+# ---------------------------------------------------------------------------
+# SITE / WAREHOUSE RULES
+# ---------------------------------------------------------------------------
+WH_SITE_CODE = 9950                      # the only Accessories-relevant warehouse
+
+# Only STORAGE_LOCATION_ID 10 ("Brick & Mortar") at the warehouse represents
+# genuinely available, free-to-allocate stock. Every other location (20, 30,
+# 40, 50, 55, 70, 71, 96...) is some form of held/blocked/channel-reserved
+# stock and must NOT be counted as available for store replenishment.
+WH_AVAILABLE_STORAGE_LOCATION = 10
+
+# STORAGE_LOCATION_ID 40 = stock blocked/reserved for NSO (New Store Opening)
+# / upcoming new stores -- confirmed by Puneet, reported separately, never
+# counted as available WH stock.
+NSO_BLOCKED_STORAGE_LOCATION = 40
+EXCLUDED_WH_CODES = [9951, 9952]         # explicitly not for Accessories
+STORE_CODE_PATTERN = r"^5\d{3}$"         # stores are 4-digit codes starting with 5
+
+# ---------------------------------------------------------------------------
+# AG (SUBCLASS_DESC) NORMALIZATION
+# ---------------------------------------------------------------------------
+AG_PREFIX_TO_STRIP = "ACC "
+# AGs that must NEVER be auto-mapped to a similarly-named official AG,
+# even though string similarity is high — confirmed genuinely distinct.
+AG_NEVER_AUTOMAP = ["BOYS SOCKS", "GIRLS SOCKS", "KIDS BACKPACK", "FACE MASK"]
+
+# ---------------------------------------------------------------------------
+# QUANTITY FORMULAS
+# ---------------------------------------------------------------------------
+def pack_multiplier(pack_qty):
+    """PACK_QTY = 0 must be treated as multiplier 1, never 0."""
+    return pack_qty if pack_qty and pack_qty > 0 else 1
+
+def available_qty_multiplier(site, pack_qty):
+    """
+    CONFIRMED RULE (site-conditional): UNRESTRICTED_AVAILABLE_QTY uses the
+    PACK_QTY multiplier ONLY at the warehouse (SITE 9950). At Store level
+    (or any Store+AG combination), UNRESTRICTED_AVAILABLE_QTY is used RAW,
+    with no multiplier. GIT_QTY and TSF_EXPECTED_QTY are NOT affected by
+    this rule -- they always get the pack multiplier, at every level.
+    """
+    if site == WH_SITE_CODE:
+        return pack_multiplier(pack_qty)
+    return 1
+
+# ---------------------------------------------------------------------------
+# SALES DATA CLEANUP
+# ---------------------------------------------------------------------------
+CLIP_NEGATIVE_SALES_TO_ZERO = True
+
+# A PACK_QTY value above this is treated as a likely data-entry error (not a
+# real pack size) and flagged in the exceptions report, though it is still
+# used if it is genuinely the highest value found for that AG (per the
+# "take the highest value" rule) -- flagged, not silently dropped.
+PACK_QTY_OUTLIER_THRESHOLD = 100
+
+# ---------------------------------------------------------------------------
+# AG PRIORITY COMBINATION (Input-3: Qty Rank + Sales Rank -> one Final rank)
+# ---------------------------------------------------------------------------
+AG_RANK_WEIGHT_SALES = 0.6
+AG_RANK_WEIGHT_QTY = 0.4
+
+# ---------------------------------------------------------------------------
+# COLUMN NAME MAPPINGS — change here if source files rename anything
+# ---------------------------------------------------------------------------
+SOH_COLS = {
+    "site": "SITE",
+    "site_desc": "SITE_DESC",
+    "site_category": "SITE_CATEGORY",
+    "division": "DIVISION_DESC",
+    "group": "GROUP_DESC",
+    "department": "DEPARTMENT_DESC",
+    "class": "CLASS_DESC",
+    "subclass": "SUBCLASS_DESC",
+    "item_desc": "ITEM_DESCRIPTION",
+    "style": "STYLE_DESC",
+    "colour": "COLOUR_DESC",
+    "size": "SIZE_DESC",
+    "season": "SEASON_DESC",
+    "article": "ARTICLE",
+    "pack_qty": "PACK_QTY",
+    "available_qty": "UNRESTRICTED_AVAILABLE_QTY",
+    "git_qty": "GIT_QTY",
+    "tsf_expected_qty": "TSF_EXPECTED_QTY",
+    "storage_location": "STORAGE_LOCATION_ID",
+}
+
+INPUT2_COLS = {
+    "store": "STORE\nCODE",
+    "ag": "SUB_NAME",
+    "final_vt": "Final\nVariety Target",
+    "final_mbq": "REVISED\nFinal\nMBQ",
+}
+
+INPUT3_COLS = {
+    "ag": None,  # first column, name varies — resolved positionally in code
+    "qty_rank": "Qty - Rank-1",
+    "sales_rank": "Sales - Rank-2",
+}
+
+INPUT4_COLS = {
+    "store": "STORE\nCODE",
+    "store_name": "Str Name",
+    "rank": "Rank",
+}
+
+INPUT5_COLS = {
+    "store": "STORE\nCODE",
+    "ag": "SUB_NAME",
+    "fill_rate_pct": "MBQ%",
+}
+
+INPUT6_COLS = {
+    "store": "STORECODE",
+    "ag": "SUB_NAME",
+    "qty_7d": "QTY sold in last 7 days",
+    "sales_7d": "Sales of Last 7 days",
+}
+
+
+# ============================================================================
+# SECTION: IO_LOADERS
+# ============================================================================
+"""
+IO layer: loads SOH (zipped/csv region files) and Input-2..6, all located
+directly inside INPUT_DIR by matching the start of each filename -- no
+subfolder, no exact-filename dependency (tolerant of the daily date suffix
+on SOH files, and minor trailing-text differences on Input-2..6).
+"""
+
+
+
+def _log(lines, msg):
+    lines.append(msg)
+    print(msg)
+
+
+def _find_by_prefix(input_dir, prefix, log, label, allow_multiple_soh=False):
+    """Finds file(s) in input_dir whose name starts with `prefix`
+    (case-insensitive). Returns a list of matching paths."""
+    all_files = [f for f in glob.glob(os.path.join(input_dir, "*")) if os.path.isfile(f)]
+    matches = [f for f in all_files if os.path.basename(f).lower().startswith(prefix.lower())]
+    if not matches:
+        raise FileNotFoundError(
+            f"No file found in {input_dir} starting with '{prefix}' (expected the {label} file). "
+            f"Files present: {[os.path.basename(f) for f in all_files]}"
+        )
+    if len(matches) > 1 and not allow_multiple_soh:
+        _log(log, f"   WARNING: multiple files match '{prefix}*' for {label} "
+                   f"({[os.path.basename(m) for m in matches]}) — using the first one alphabetically: "
+                   f"{os.path.basename(sorted(matches)[0])}")
+        return [sorted(matches)[0]]
+    return matches
+
+
+def load_soh(input_dir, log):
+    """Finds every file starting with 'SOH' directly in input_dir, extracts
+    zips (regardless of their extension) to a temp dir, and concatenates
+    every CSV found."""
+    soh_files = _find_by_prefix(input_dir, SOH_FILE_PREFIX, log, "SOH", allow_multiple_soh=True)
+    _log(log, f"STEP 1a: Found {len(soh_files)} file(s) starting with 'SOH' in {input_dir}")
+
+    csv_paths = []
+    tmpdir = tempfile.mkdtemp(prefix="soh_extract_")
+
+    for f in soh_files:
+        if f.lower().endswith(".csv"):
+            csv_paths.append(f)
+        else:
+            try:
+                with zipfile.ZipFile(f) as z:
+                    z.extractall(tmpdir)
+                    for name in z.namelist():
+                        if name.lower().endswith(".csv"):
+                            csv_paths.append(os.path.join(tmpdir, name))
+                _log(log, f"   Extracted {os.path.basename(f)}")
+            except zipfile.BadZipFile:
+                _log(log, f"   WARNING: {os.path.basename(f)} is neither .csv nor a valid zip — skipped")
+
+    if not csv_paths:
+        raise FileNotFoundError(f"No readable CSV files found among SOH files in {input_dir}")
+
+    _log(log, f"STEP 1b: Reading {len(csv_paths)} CSV file(s)...")
+    needed_cols = list(SOH_COLS.values())
+    frames = []
+    for p in csv_paths:
+        d = pd.read_csv(p, usecols=lambda c: c in needed_cols, low_memory=False)
+        frames.append(d)
+        _log(log, f"   {os.path.basename(p)}: {d.shape[0]:,} rows")
+
+    df = pd.concat(frames, ignore_index=True)
+    _log(log, f"STEP 1c: Combined SOH shape = {df.shape[0]:,} rows x {df.shape[1]} cols")
+
+    missing_cols = [c for c in needed_cols if c not in df.columns]
+    if missing_cols:
+        raise ValueError(f"SOH files are missing expected columns: {missing_cols}")
+
+    return df
+
+
+def load_input2(input_dir, log):
+    path = _find_by_prefix(input_dir, INPUT2_FILE_PREFIX, log, "Input-2 (VT & MBQ targets)")[0]
+    df = pd.read_excel(path)
+    _log(log, f"STEP 2: Input-2 (VT & MBQ base targets) loaded from '{os.path.basename(path)}': {df.shape[0]:,} rows")
+    C = INPUT2_COLS
+    for key in ["store", "ag", "final_vt", "final_mbq"]:
+        if C[key] not in df.columns:
+            raise ValueError(f"Input-2 missing expected column '{C[key]}' (config key '{key}')")
+    n_blank_vt = df[C["final_vt"]].isna().sum()
+    n_blank_mbq = df[C["final_mbq"]].isna().sum()
+    if n_blank_vt or n_blank_mbq:
+        _log(log, f"   WARNING: {n_blank_vt} rows blank Final VT, {n_blank_mbq} rows blank Final MBQ")
+    return df
+
+
+def load_input3(input_dir, log):
+    path = _find_by_prefix(input_dir, INPUT3_FILE_PREFIX, log, "Input-3 (AG Priority)")[0]
+    df = pd.read_excel(path)
+    df = df.rename(columns={df.columns[0]: "AG"})
+    _log(log, f"STEP 3: Input-3 (AG Priority) loaded from '{os.path.basename(path)}': {df.shape[0]:,} AGs")
+    return df
+
+
+def load_input4(input_dir, log):
+    path = _find_by_prefix(input_dir, INPUT4_FILE_PREFIX, log, "Input-4 (Store Priority)")[0]
+    df = pd.read_excel(path)
+    _log(log, f"STEP 4: Input-4 (Store Priority) loaded from '{os.path.basename(path)}': {df.shape[0]:,} stores")
+    return df
+
+
+def load_input5(input_dir, log):
+    path = _find_by_prefix(input_dir, INPUT5_FILE_PREFIX, log, "Input-5 (Seasonal Fill Rate %)")[0]
+    df = pd.read_excel(path)
+    _log(log, f"STEP 5: Input-5 (Seasonal Fill Rate %) loaded from '{os.path.basename(path)}': {df.shape[0]:,} rows")
+    return df
+
+
+def load_input6(input_dir, log):
+    path = _find_by_prefix(input_dir, INPUT6_FILE_PREFIX, log, "Input-6 (Last 7-day Sales)")[0]
+    df = pd.read_excel(path)
+    _log(log, f"STEP 6: Input-6 (Last 7-day Sales) loaded from '{os.path.basename(path)}': {df.shape[0]:,} rows")
+    C6 = INPUT6_COLS
+    n_dupe = df.duplicated(subset=[C6["store"], C6["ag"]]).sum()
+    if n_dupe:
+        _log(log, f"   WARNING: {n_dupe} duplicate Store+AG rows in Input-6 — these will be summed")
+    return df
+
+
+# ============================================================================
+# SECTION: TRANSFORM
+# ============================================================================
+"""
+Core business logic: AG normalization, Article-level formulas, Store+AG
+aggregation, priority combination, gap calculation, and the WH allocation
+waterfall.
+"""
+
+
+C = SOH_COLS
+
+
+def normalize_ag(raw):
+    s = str(raw).strip().upper()
+    prefix = AG_PREFIX_TO_STRIP.strip()
+    s = re.sub(rf'^{re.escape(prefix)}\s+', '', s)
+    s = re.sub(r'\s+', ' ', s)
+    return s
+
+
+def analyze_ag_pack_qty(soh_df, log):
+    """
+    Representative PACK_Qty per AG, per confirmed rule: only a row where
+    PACK_QTY > 0 AND UNRESTRICTED_AVAILABLE_QTY > 0 (i.e. it actually holds
+    stock) is eligible. Among eligible rows for an AG, the one with the
+    MOST stock wins (most representative of real volume). A PACK_QTY on a
+    zero-stock row is never used, however large it is.
+
+    Returns (ag_pack_df, inconsistent_df):
+      ag_pack_df: one row per AG, with PACK_Qty_Representative (1 if no
+        row for that AG ever qualifies -- no stock-holding row with a
+        real pack size at all)
+      inconsistent_df: AGs where more than one distinct qualifying
+        PACK_QTY value was found (genuinely differing pack sizes, both
+        actually holding stock) -- for the exceptions report
+    """
+    valid = soh_df[soh_df["AG_Mapped"].notna()]
+    qualifying = valid[(valid[C["pack_qty"]] > 0) & (valid[C["available_qty"]] > 0)].copy()
+
+    if len(qualifying):
+        idx = qualifying.groupby("AG_Mapped")[C["available_qty"]].idxmax()
+        rep = qualifying.loc[idx, ["AG_Mapped", C["pack_qty"]]].rename(
+            columns={C["pack_qty"]: "PACK_Qty_Representative"})
+        distinct = (
+            qualifying.groupby("AG_Mapped")[C["pack_qty"]]
+            .apply(lambda s: sorted(s.unique()))
+            .rename("Distinct_Qualifying_PACK_QTY")
+            .reset_index()
+        )
+        ag_pack_df = distinct.merge(rep, on="AG_Mapped", how="left")
+    else:
+        ag_pack_df = pd.DataFrame(columns=["AG_Mapped", "Distinct_Qualifying_PACK_QTY", "PACK_Qty_Representative"])
+
+    ag_pack_df["Is_Inconsistent"] = ag_pack_df["Distinct_Qualifying_PACK_QTY"].apply(len) > 1
+    ag_pack_df["Has_Suspicious_Outlier"] = ag_pack_df["PACK_Qty_Representative"] > PACK_QTY_OUTLIER_THRESHOLD
+
+    all_ags = set(valid["AG_Mapped"].unique())
+    covered_ags = set(ag_pack_df["AG_Mapped"])
+    no_qualifying_row = all_ags - covered_ags
+    if no_qualifying_row:
+        extra = pd.DataFrame({
+            "AG_Mapped": sorted(no_qualifying_row),
+            "Distinct_Qualifying_PACK_QTY": [[] for _ in no_qualifying_row],
+            "PACK_Qty_Representative": 1,
+            "Is_Inconsistent": False,
+            "Has_Suspicious_Outlier": False,
+        })
+        ag_pack_df = pd.concat([ag_pack_df, extra], ignore_index=True)
+
+    inconsistent_df = ag_pack_df[ag_pack_df["Is_Inconsistent"]].copy()
+    n_no_qualifying = len(no_qualifying_row)
+    n_outlier = ag_pack_df["Has_Suspicious_Outlier"].sum()
+
+    log.append(f"STEP 7b: PACK_QTY representative value per AG — only rows with PACK_QTY>0 AND "
+               f"UNRESTRICTED_AVAILABLE_QTY>0 (i.e. actually holding stock) are eligible; among "
+               f"those, the one with the most stock is used. {len(ag_pack_df)} AGs checked, "
+               f"{n_no_qualifying} had NO stock-holding row with a real PACK_QTY at all (defaulted "
+               f"to 1), {len(inconsistent_df)} have genuinely differing PACK_QTY values across "
+               f"multiple stock-holding rows, {n_outlier} of those include a value "
+               f">{PACK_QTY_OUTLIER_THRESHOLD} (still flagged in Exceptions report for review).")
+    return ag_pack_df, inconsistent_df
+
+
+def build_ag_mapping(soh_df, official_ags, log):
+    """Maps SOH's raw SUBCLASS_DESC to the official AG list. Returns the SOH
+    df with an AG_Mapped column (NaN = exception, not on official list)."""
+    official_norm = {normalize_ag(a): a for a in official_ags}
+    never_automap = set(AG_NEVER_AUTOMAP)
+
+    def map_one(raw):
+        norm = normalize_ag(raw)
+        if norm in never_automap:
+            return np.nan
+        return official_norm.get(norm, np.nan)
+
+    soh_df = soh_df.copy()
+    soh_df["AG_Mapped"] = soh_df[C["subclass"]].apply(map_one)
+    n_unmatched = soh_df["AG_Mapped"].isna().sum()
+    log.append(f"STEP 7: AG name mapping — {n_unmatched:,} / {len(soh_df):,} SOH rows "
+               f"did not match an official AG (excluded from gap calc, kept in exceptions report)")
+    return soh_df
+
+
+def compute_article_level_qtys(soh_df, log):
+    soh_df = soh_df.copy()
+    pack_mult = soh_df[C["pack_qty"]].apply(pack_multiplier)
+    avail_mult = soh_df.apply(lambda r: available_qty_multiplier(r[C["site"]], r[C["pack_qty"]]), axis=1)
+
+    soh_df["Final_Available_Qty"] = soh_df[C["available_qty"]] * avail_mult
+    soh_df["Final_GIT_Qty"] = soh_df[C["git_qty"]] * pack_mult
+    soh_df["Final_TSF_Expected_Qty"] = soh_df[C["tsf_expected_qty"]] * pack_mult
+    n_zero_pack = (soh_df[C["pack_qty"]] == 0).sum()
+    n_wh_rows = (soh_df[C["site"]] == WH_SITE_CODE).sum()
+    log.append(f"STEP 8: Article-level Final Qty columns computed "
+               f"({n_zero_pack:,} rows had PACK_QTY=0, treated as multiplier 1). "
+               f"PACK_QTY multiplier applied to Available Qty ONLY at WH SITE {WH_SITE_CODE} "
+               f"({n_wh_rows:,} rows) -- Store-side Available Qty is used RAW, no multiplier. "
+               f"GIT and TSF_Expected always get the multiplier, at every site.")
+    return soh_df
+
+
+def split_store_wh(soh_df, log):
+    store_df = soh_df[soh_df[C["site_category"]] == "Store"].copy()
+    wh_df = soh_df[soh_df[C["site"]] == WH_SITE_CODE].copy()
+    other_wh = soh_df[soh_df[C["site"]].isin(EXCLUDED_WH_CODES)]
+    log.append(f"STEP 9: Split SOH — {len(store_df):,} Store rows, {len(wh_df):,} WH(9950) rows "
+               f"({len(other_wh):,} rows from excluded warehouses {EXCLUDED_WH_CODES} dropped)")
+    return store_df, wh_df
+
+
+def apply_store_scope(store_df, input4_df, log):
+    C4 = INPUT4_COLS
+    active_stores = set(input4_df[C4["store"]].unique())
+    before = store_df[C["site"]].nunique()
+    dropped = sorted(set(store_df[C["site"]].unique()) - active_stores)
+    scoped = store_df[store_df[C["site"]].isin(active_stores)].copy()
+    log.append(f"STEP 10: Store scope filter — {before} stores in SOH, "
+               f"{scoped[C['site']].nunique()} kept (ranked in Input-4), "
+               f"{len(dropped)} dropped (not-yet-open or closing): {dropped}")
+    return scoped, dropped
+
+
+def aggregate_store_ag(store_df, active_stores, official_ags, log):
+    """
+    Builds the FULL universe of (active store x official AG) combinations
+    first, then left-merges actual SOH-derived aggregates onto it. This
+    guarantees every combination gets a row -- including a store that
+    currently carries ZERO stock of an AG (sold out, or a deliberate
+    space-crunch exclusion) -- rather than silently vanishing because it
+    had no SOH rows to aggregate. A "Has_SOH_Presence" flag marks which
+    rows actually had stock data vs. were filled in as zero.
+    """
+    universe = pd.DataFrame(
+        [(s, a) for s in sorted(active_stores) for a in sorted(official_ags)],
+        columns=[C["site"], "AG_Mapped"],
+    )
+
+    valid = store_df[store_df["AG_Mapped"].notna()].copy()
+    valid["Option_Key"] = valid[C["style"]].astype(str) + "||" + valid[C["colour"]].astype(str)
+    valid["is_present"] = (
+        valid["Final_Available_Qty"] + valid["Final_GIT_Qty"] + valid["Final_TSF_Expected_Qty"]
+    ) > 0
+
+    vt_agg = (
+        valid[valid["is_present"]]
+        .groupby([C["site"], "AG_Mapped"])["Option_Key"]
+        .nunique()
+        .rename("VT_Available")
+        .reset_index()
+    )
+
+    store_agg = (
+        valid.groupby([C["site"], "AG_Mapped"])
+        .agg(
+            Store_Final_Available_Qty=("Final_Available_Qty", "sum"),
+            Store_Final_GIT_Qty=("Final_GIT_Qty", "sum"),
+            Store_Final_TSF_Expected_Qty=("Final_TSF_Expected_Qty", "sum"),
+        )
+        .reset_index()
+    )
+    store_agg = store_agg.merge(vt_agg, on=[C["site"], "AG_Mapped"], how="left")
+
+    universe = universe.merge(store_agg, on=[C["site"], "AG_Mapped"], how="left")
+    universe["Has_SOH_Presence"] = universe["Store_Final_Available_Qty"].notna()
+
+    fill_cols = ["Store_Final_Available_Qty", "Store_Final_GIT_Qty",
+                 "Store_Final_TSF_Expected_Qty", "VT_Available"]
+    for c in fill_cols:
+        universe[c] = universe[c].fillna(0)
+    universe["VT_Available"] = universe["VT_Available"].astype(int)
+    universe["Store_Effective_Position"] = (
+        universe["Store_Final_Available_Qty"]
+        + universe["Store_Final_GIT_Qty"]
+        + universe["Store_Final_TSF_Expected_Qty"]
+    )
+
+    n_zero_stock = (~universe["Has_SOH_Presence"]).sum()
+    log.append(f"STEP 11: Store+AG UNIVERSE built as a full cross-join of "
+               f"{len(active_stores)} active stores x {len(official_ags)} official AGs "
+               f"= {len(universe):,} rows. {n_zero_stock:,} of these combinations have "
+               f"ZERO SOH presence (no stock/GIT/TSF at all for that store+AG) — kept in the "
+               f"report as zero rows (flagged 'Has_SOH_Presence'=False), not dropped, so nothing "
+               f"from Input-6 sales or the true gap size is silently lost.")
+    return universe
+
+
+def aggregate_wh_ag(wh_df, log):
+    """AG-level WH totals (for Output-2 diagnostic columns): WH Available
+    and WH GIT, both already correctly PACK_QTY-multiplied per the
+    site-conditional rule. CORRECTED: only STORAGE_LOCATION_ID=10
+    ("Brick & Mortar" -- genuinely available stock) is counted; every
+    other storage location (NSO-blocked, Online, Lot Sale, EOSS, etc.)
+    is excluded, since that stock is not actually free to allocate.
+    This total is repeated across every store row for the same AG."""
+    valid = wh_df[
+        (wh_df["AG_Mapped"].notna()) & (wh_df[C["storage_location"]] == WH_AVAILABLE_STORAGE_LOCATION)
+    ].copy()
+    wh_ag = (
+        valid.groupby("AG_Mapped")
+        .agg(
+            WH_Final_Available_Qty=("Final_Available_Qty", "sum"),
+            WH_Final_GIT_Qty=("Final_GIT_Qty", "sum"),
+        )
+        .reset_index()
+    )
+    log.append(f"STEP 12b: WH AG-level totals (Available + GIT) built — {len(wh_ag):,} AGs. "
+               f"CORRECTED: only STORAGE_LOCATION_ID={WH_AVAILABLE_STORAGE_LOCATION} rows counted "
+               f"as genuinely available (every other storage location at the WH is excluded).")
+    return wh_ag
+
+
+def aggregate_wh_article(wh_df, log):
+    """Keeps WH data at Article grain (needed for allocation) but only for
+    AGs that mapped successfully. CORRECTED: only STORAGE_LOCATION_ID=10
+    stock is counted as available to allocate -- this feeds Output-1's
+    actual order-raising engine, so this correction changes real order
+    quantities, not just a display figure."""
+    valid = wh_df[
+        (wh_df["AG_Mapped"].notna()) & (wh_df[C["storage_location"]] == WH_AVAILABLE_STORAGE_LOCATION)
+    ].copy()
+    wh_article = (
+        valid.groupby([C["article"], "AG_Mapped", C["style"], C["colour"], C["size"], C["season"]])
+        .agg(WH_Final_Available_Qty=("Final_Available_Qty", "sum"))
+        .reset_index()
+    )
+    wh_article = wh_article[wh_article["WH_Final_Available_Qty"] > 0]
+    log.append(f"STEP 12: WH Article-level stock pool built — {len(wh_article):,} Article lines "
+               f"with available stock at SITE {WH_SITE_CODE}, STORAGE_LOCATION_ID="
+               f"{WH_AVAILABLE_STORAGE_LOCATION} only")
+    return wh_article
+
+
+def analyze_wh_storage_locations(wh_df, log):
+    """Diagnostic: how much WH stock sits in each storage location, so it's
+    clear where the 'available' total is coming from and what's excluded."""
+    valid = wh_df[wh_df["AG_Mapped"].notna()].copy()
+    by_loc = (
+        valid.groupby(C["storage_location"])
+        .agg(Rows=("Final_Available_Qty", "size"),
+             Final_Available_Qty=("Final_Available_Qty", "sum"),
+             Final_GIT_Qty=("Final_GIT_Qty", "sum"))
+        .reset_index()
+    )
+    log.append("STEP 12c: WH stock by STORAGE_LOCATION_ID:\n" +
+               "\n".join(f"    Location {r[C['storage_location']]}: {r['Rows']:,} rows, "
+                          f"{r['Final_Available_Qty']:,.0f} Available, {r['Final_GIT_Qty']:,.0f} GIT"
+                          for _, r in by_loc.iterrows()))
+    return by_loc
+
+
+def analyze_nso_blocked_stock(soh_df, log):
+    """Stock held under STORAGE_LOCATION_ID=40 (blocked for NSO / upcoming
+    new stores), at Site+AG grain, wherever it appears in the data (WH or
+    store-side) -- for the Exceptions report. This stock is never counted
+    as available in any other part of the pipeline."""
+    valid = soh_df[
+        (soh_df["AG_Mapped"].notna()) & (soh_df[C["storage_location"]] == NSO_BLOCKED_STORAGE_LOCATION)
+    ].copy()
+    blocked = (
+        valid.groupby([C["site"], C["site_desc"], "AG_Mapped"])
+        .agg(Blocked_Available_Qty=("Final_Available_Qty", "sum"),
+             Blocked_GIT_Qty=("Final_GIT_Qty", "sum"))
+        .reset_index()
+    )
+    blocked = blocked[(blocked["Blocked_Available_Qty"] > 0) | (blocked["Blocked_GIT_Qty"] > 0)]
+    total = blocked["Blocked_Available_Qty"].sum()
+    log.append(f"STEP 12d: NSO-blocked stock (STORAGE_LOCATION_ID={NSO_BLOCKED_STORAGE_LOCATION}) — "
+               f"{len(blocked):,} Site+AG combinations hold blocked stock, {total:,.0f} total units")
+    return blocked
+
+
+def combine_ag_priority(input3_df, log):
+    C3 = INPUT3_COLS
+    df = input3_df.copy()
+    df["Combined_Score"] = (
+        AG_RANK_WEIGHT_SALES * df[C3["sales_rank"]]
+        + AG_RANK_WEIGHT_QTY * df[C3["qty_rank"]]
+    )
+    # rank ascending (lowest score = highest priority = rank 1); tie-break on Sales rank
+    df = df.sort_values(["Combined_Score", C3["sales_rank"]]).reset_index(drop=True)
+    df["AG_Priority_Rank"] = range(1, len(df) + 1)
+    log.append(f"STEP 13: AG priority combined "
+               f"({int(AG_RANK_WEIGHT_SALES*100)}% Sales rank + {int(AG_RANK_WEIGHT_QTY*100)}% Qty rank), "
+               f"re-ranked into {len(df)} AGs")
+    return df[["AG", "AG_Priority_Rank"]]
+
+
+def compute_effective_mbq(input2_df, input5_df, log):
+    C2, C5 = INPUT2_COLS, INPUT5_COLS
+    merged = input2_df.merge(
+        input5_df[[C5["store"], C5["ag"], C5["fill_rate_pct"]]],
+        left_on=[C2["store"], C2["ag"]],
+        right_on=[C5["store"], C5["ag"]],
+        how="left",
+    )
+    n_missing_fill = merged[C5["fill_rate_pct"]].isna().sum()
+    merged[C5["fill_rate_pct"]] = merged[C5["fill_rate_pct"]].fillna(1.0)
+    merged["Effective_MBQ"] = merged[C2["final_mbq"]] * merged[C5["fill_rate_pct"]]
+    merged["Effective_MBQ"] = merged["Effective_MBQ"].round().astype(int)
+    log.append(f"STEP 14: Effective MBQ computed (Final MBQ x Seasonal Fill%); "
+               f"{n_missing_fill:,} rows had no Input-5 match, defaulted Fill% to 1.0 (100%)")
+    return merged
+
+
+def clip_negative_sales(input6_df, log):
+    C6 = INPUT6_COLS
+    df = input6_df.copy()
+    n_neg = (df[C6["qty_7d"]] < 0).sum()
+    if CLIP_NEGATIVE_SALES_TO_ZERO:
+        df[C6["qty_7d"]] = df[C6["qty_7d"]].clip(lower=0)
+        df[C6["sales_7d"]] = df[C6["sales_7d"]].clip(lower=0)
+    log.append(f"STEP 15: Sales cleanup — {n_neg} row(s) had negative qty, clipped to 0")
+    return df
+
+
+# ============================================================================
+# SECTION: ALLOCATION
+# ============================================================================
+"""
+Allocation engine: distributes finite WH (SITE 9950) stock across stores
+for REPLENISHMENT ONLY (existing Articles at a store — no new-option lines).
+
+Waterfall order:
+  1. Store Priority Rank (ascending — rank 1 served first)
+  2. AG Priority Rank (ascending, within a store)
+  3. Within a Store+AG, existing Articles are prioritized:
+       a) Articles with Available SOH > 0 at that store (top up what's alive)
+       b) then by latest Season (NOS-26 before NOS-25, etc.)
+     and the Store+AG's gap is filled across these Articles in that order,
+     each capped by remaining WH stock for that Article, until the gap is
+     filled or WH/Articles run out.
+
+A Store+AG with a real gap but ZERO existing Articles at that store cannot
+be actioned by this model (replenishment-only scope — no new-option
+introduction), and is logged to the exceptions report instead.
+"""
+
+
+C = SOH_COLS
+
+
+def _season_recency_key(season_desc):
+    """Higher number = more recent = higher priority. Seasons with no
+    parseable 2-digit year sort last (treated as least recent)."""
+    if pd.isna(season_desc):
+        return -1
+    m = re.search(r'(\d{2})(?!.*\d)', str(season_desc))
+    return int(m.group(1)) if m else -1
+
+
+def build_demand(store_agg, effective_mbq_df, store_priority_df, ag_priority_df, log):
+    C2, C4 = INPUT2_COLS, INPUT4_COLS
+
+    demand = store_agg.merge(
+        effective_mbq_df[[C2["store"], C2["ag"], "Effective_MBQ", C2["final_vt"], C2["final_mbq"]]],
+        left_on=[C["site"], "AG_Mapped"],
+        right_on=[C2["store"], C2["ag"]],
+        how="left",
+    )
+    n_no_target = demand["Effective_MBQ"].isna().sum()
+    demand["Effective_MBQ"] = demand["Effective_MBQ"].fillna(0)
+    demand["MBQ_Gap"] = (demand["Effective_MBQ"] - demand["Store_Effective_Position"]).clip(lower=0).astype(int)
+
+    demand = demand.merge(store_priority_df[[C4["store"], C4["rank"]]],
+                           left_on=C["site"], right_on=C4["store"], how="left")
+    demand = demand.merge(ag_priority_df.rename(columns={"AG": "AG_Mapped"}),
+                           on="AG_Mapped", how="left")
+
+    log.append(f"STEP 16: Demand built — {len(demand):,} Store+AG rows "
+               f"({n_no_target:,} had no VT/MBQ target in Input-2, treated as Effective_MBQ=0); "
+               f"{(demand['MBQ_Gap']>0).sum():,} rows have a real MBQ gap to fill")
+    return demand
+
+
+def allocate(demand_df, store_article_df, wh_article_df, log):
+    """Returns (order_lines_df, updated_demand_df_with_fill_results, unfillable_df)."""
+    C4 = INPUT4_COLS
+
+    # WH remaining pool, keyed by Article — will be decremented as we allocate
+    wh_pool = wh_article_df.set_index(C["article"])["WH_Final_Available_Qty"].to_dict()
+
+    # existing Articles per Store+AG (replenishment candidates)
+    store_article_df = store_article_df.copy()
+    store_article_df["season_rank"] = store_article_df[C["season"]].apply(_season_recency_key)
+    store_article_df["has_stock"] = store_article_df["Final_Available_Qty"] > 0
+
+    gap_rows = demand_df[demand_df["MBQ_Gap"] > 0].copy()
+    gap_rows = gap_rows.sort_values([C4["rank"], "AG_Priority_Rank"], na_position="last")
+
+    order_lines = []
+    unfillable = []
+
+    for _, row in gap_rows.iterrows():
+        site, ag, gap = row[C["site"]], row["AG_Mapped"], row["MBQ_Gap"]
+
+        candidates = store_article_df[
+            (store_article_df[C["site"]] == site) & (store_article_df["AG_Mapped"] == ag)
+        ].drop_duplicates(subset=[C["article"]])
+
+        if candidates.empty:
+            unfillable.append({
+                C["site"]: site, "AG": ag, "MBQ_Gap": gap,
+                "Reason": "No existing Article at this store — replenishment-only scope can't action (needs New Option introduction)"
+            })
+            continue
+
+        candidates = candidates.sort_values(["has_stock", "season_rank"], ascending=[False, False])
+
+        remaining_gap = gap
+        for _, art_row in candidates.iterrows():
+            if remaining_gap <= 0:
+                break
+            article = art_row[C["article"]]
+            wh_avail = wh_pool.get(article, 0)
+            if wh_avail <= 0:
+                continue
+            alloc_qty = min(remaining_gap, wh_avail)
+            if alloc_qty <= 0:
+                continue
+            order_lines.append({
+                C["site"]: site,
+                C["article"]: article,
+                "AG": ag,
+                "Allocated_Qty": alloc_qty,
+            })
+            wh_pool[article] = wh_avail - alloc_qty
+            remaining_gap -= alloc_qty
+
+        if remaining_gap > 0:
+            unfillable.append({
+                C["site"]: site, "AG": ag, "MBQ_Gap": gap,
+                "Reason": f"WH stock exhausted for existing Articles — {int(remaining_gap)} units short"
+            })
+
+    order_df = pd.DataFrame(order_lines)
+    unfillable_df = pd.DataFrame(unfillable)
+
+    total_allocated = order_df["Allocated_Qty"].sum() if not order_df.empty else 0
+    log.append(f"STEP 17: Allocation waterfall complete — {len(order_df):,} order lines, "
+               f"{total_allocated:,.0f} total units allocated; "
+               f"{len(unfillable_df):,} Store+AG rows could not be fully filled")
+    return order_df, unfillable_df
+
+
+# ============================================================================
+# SECTION: MAIN
+# ============================================================================
+"""
+Accessories Auto-Replenishment Pipeline — main entry point.
+
+Run:  python main.py
+
+Reads all inputs from INPUT_DIR (see config.py -- flat folder, files matched
+by name prefix), computes VT/MBQ gaps at Store+AG level, allocates finite WH
+(SITE 9950) stock across stores for REPLENISHMENT ONLY, and writes two Excel
+outputs plus a run log and an exceptions report -- every output filename
+suffixed with the run date.
+"""
+
+
+C = SOH_COLS
+C2, C3, C4, C5, C6 = (INPUT2_COLS, INPUT3_COLS, INPUT4_COLS,
+                       INPUT5_COLS, INPUT6_COLS)
+
+
+def run(input_dir=INPUT_DIR, output_dir=OUTPUT_DIR, run_date=None):
+    t0 = time.time()
+    os.makedirs(output_dir, exist_ok=True)
+    paths = get_output_paths(run_date, output_dir)
+    log = []
+    log.append("=" * 78)
+    log.append(f"ACCESSORIES AUTO-REPLENISHMENT PIPELINE — RUN START ({time.strftime('%Y-%m-%d %H:%M:%S')})")
+    log.append(f"Input folder:  {input_dir}")
+    log.append(f"Output folder: {output_dir}  (all filenames suffixed with today's date)")
+    log.append("=" * 78)
+
+    # ---- STEP 1-6: Load everything (flat folder, matched by filename prefix) ----
+    soh_df = load_soh(input_dir, log)
+    input2_df = load_input2(input_dir, log)
+    input3_df = load_input3(input_dir, log)
+    input4_df = load_input4(input_dir, log)
+    input5_df = load_input5(input_dir, log)
+    input6_df = load_input6(input_dir, log)
+
+    official_ags = set(input3_df["AG"].unique())
+    active_stores = set(input4_df[C4["store"]].unique())
+
+    # ---- STEP 7-9: AG mapping, PACK_QTY check, Article-level formulas, Store/WH split ----
+    soh_df = build_ag_mapping(soh_df, official_ags, log)
+    ag_pack_df, pack_inconsistent_df = analyze_ag_pack_qty(soh_df, log)
+    soh_df = compute_article_level_qtys(soh_df, log)
+    store_df, wh_df = split_store_wh(soh_df, log)
+
+    # ---- STEP 10: Store scope (Input-4 defines "active") ----
+    store_df, dropped_stores = apply_store_scope(store_df, input4_df, log)
+
+    # ---- STEP 11-12: Aggregate Store+AG (FULL cross-join universe) and WH pools ----
+    store_agg = aggregate_store_ag(store_df, active_stores, official_ags, log)
+    wh_article = aggregate_wh_article(wh_df, log)
+    wh_ag = aggregate_wh_ag(wh_df, log)
+    wh_loc_breakdown = analyze_wh_storage_locations(wh_df, log)
+    nso_blocked_df = analyze_nso_blocked_stock(soh_df, log)
+
+    # ---- STEP 13-15: Priority, Effective MBQ, sales cleanup ----
+    ag_priority_df = combine_ag_priority(input3_df, log)
+    effective_mbq_df = compute_effective_mbq(input2_df, input5_df, log)
+    input6_raw_qty = input6_df[C6["qty_7d"]].sum()
+    input6_df = clip_negative_sales(input6_df, log)
+    input6_clipped_qty = input6_df[C6["qty_7d"]].sum()
+    # Input-6 rows for stores that are NOT ranked in Input-4 (excluded by the store-scope rule)
+    input6_excluded = input6_df[~input6_df[C6["store"]].isin(active_stores)].copy()
+
+    # Sum any duplicate Store+AG rows in Input-6 before merging (never silently
+    # drop or overwrite one of a pair of duplicate rows)
+    input6_agg = (
+        input6_df.groupby([C6["store"], C6["ag"]])
+        .agg(**{C6["qty_7d"]: (C6["qty_7d"], "sum"), C6["sales_7d"]: (C6["sales_7d"], "sum")})
+        .reset_index()
+    )
+
+    # ---- STEP 16-17: Build demand, allocate ----
+    demand_df = build_demand(store_agg, effective_mbq_df, input4_df, ag_priority_df, log)
+    order_df, unfillable_df = allocate(demand_df, store_df, wh_article, log)
+
+    # ---- STEP 18: Post-allocation simulation ----
+    if not order_df.empty:
+        alloc_by_store_ag = (
+            order_df.groupby([C["site"], "AG"])["Allocated_Qty"].sum().rename("Allocated_Qty").reset_index()
+        )
+    else:
+        alloc_by_store_ag = pd.DataFrame(columns=[C["site"], "AG", "Allocated_Qty"])
+
+    demand_df = demand_df.merge(
+        alloc_by_store_ag, left_on=[C["site"], "AG_Mapped"], right_on=[C["site"], "AG"], how="left"
+    )
+    demand_df["Allocated_Qty"] = demand_df["Allocated_Qty"].fillna(0)
+    demand_df["New_Effective_Position"] = demand_df["Store_Effective_Position"] + demand_df["Allocated_Qty"]
+    demand_df["MBQ_Pct_Before"] = (
+        demand_df["Store_Effective_Position"] / demand_df["Effective_MBQ"].replace(0, float("nan"))
+    ).fillna(0).round(4)
+    demand_df["MBQ_Pct_After"] = (
+        demand_df["New_Effective_Position"] / demand_df["Effective_MBQ"].replace(0, float("nan"))
+    ).fillna(0).round(4)
+    demand_df["VT_Pct"] = (
+        demand_df["VT_Available"] / demand_df[C2["final_vt"]].replace(0, float("nan"))
+    ).fillna(0).round(4)
+    log.append("STEP 18: Post-allocation MBQ%/VT% simulation computed")
+
+    # ---- STEP 19: Sales / Days of Cover (using de-duplicated Input-6) ----
+    n_before = len(demand_df)
+    demand_df = demand_df.merge(
+        input6_agg[[C6["store"], C6["ag"], C6["qty_7d"], C6["sales_7d"]]],
+        left_on=[C["site"], "AG_Mapped"], right_on=[C6["store"], C6["ag"]], how="left"
+    )
+    assert len(demand_df) == n_before, "Sales merge changed row count -- investigate duplicate keys"
+    demand_df[C6["qty_7d"]] = demand_df[C6["qty_7d"]].fillna(0)
+    demand_df[C6["sales_7d"]] = demand_df[C6["sales_7d"]].fillna(0)
+    daily_ros = demand_df[C6["qty_7d"]] / 7.0
+    demand_df["Days_of_Cover"] = (demand_df["Store_Effective_Position"] / daily_ros.replace(0, float("nan"))).round(1)
+    log.append("STEP 19: Days of Cover computed (Store Effective Position / daily ROS)")
+
+    # Input-6 reconciliation bridge: every unit must be accounted for
+    total_qty_output = demand_df[C6["qty_7d"]].sum()
+    excl_qty = input6_excluded[C6["qty_7d"]].sum()
+    excl_sales = input6_excluded[C6["sales_7d"]].sum()
+    clip_adj = input6_clipped_qty - input6_raw_qty
+    recon_diff = input6_clipped_qty - total_qty_output - excl_qty
+    log.append(f"STEP 19b: Input-6 reconciliation — raw file total Qty = {input6_raw_qty:,.0f}; "
+               f"+{clip_adj:,.0f} from clipping negative sales to 0 = {input6_clipped_qty:,.0f}. "
+               f"Of this: {total_qty_output:,.0f} appears in Output-2; {excl_qty:,.0f} units "
+               f"(sales value {excl_sales:,.0f}) belong to store(s) {[int(s) for s in sorted(input6_excluded[C6['store']].unique())]} "
+               f"which have sales in Input-6 but NO rank in Input-4, so they are outside the active-store scope. "
+               f"Unexplained difference = {recon_diff:,.0f} "
+               f"{'(FULLY RECONCILED)' if recon_diff == 0 else '(INVESTIGATE)'}")
+
+    # ---- STEP 20: Build Output-1 (replenishment order file) ----
+    store_name_map = input4_df.set_index(C4["store"])[C4["store_name"]].to_dict() if C4["store_name"] in input4_df.columns else {}
+    if not order_df.empty:
+        order_df["Store Name"] = order_df[C["site"]].map(store_name_map)
+        output1 = order_df.rename(columns={C["site"]: "Store Code", C["article"]: "Article", "Allocated_Qty": "Order Qty"})
+        output1 = output1[["Store Code", "Store Name", "Article", "AG", "Order Qty"]]
+    else:
+        output1 = pd.DataFrame(columns=["Store Code", "Store Name", "Article", "AG", "Order Qty"])
+    output1.to_excel(paths["output1"], index=False)
+    log.append(f"STEP 20: Output-1 (Replenishment Order File) written — {len(output1):,} order lines "
+               f"-> {paths['output1']}")
+
+    # ---- STEP 21: Build Output-2 (Store x AG diagnostic report) ----
+    site_desc_map = store_df.drop_duplicates(C["site"]).set_index(C["site"])[C["site_desc"]].to_dict()
+    demand_df["Site_Desc"] = demand_df[C["site"]].map(site_desc_map)
+
+    # AG-level PACK_Qty representative (highest non-zero value, per confirmed rule)
+    demand_df = demand_df.merge(
+        ag_pack_df[["AG_Mapped", "PACK_Qty_Representative"]], on="AG_Mapped", how="left"
+    )
+    demand_df["PACK_Qty_Representative"] = demand_df["PACK_Qty_Representative"].fillna(1)
+
+    # Avl.MBQ Fill% -- literal spec: Store's raw Available Qty / raw (base) MBQ from Input-2
+    demand_df["Avl_MBQ_Fill_Pct"] = (
+        demand_df["Store_Final_Available_Qty"] / demand_df[C2["final_mbq"]].replace(0, float("nan"))
+    ).fillna(0).round(4)
+    demand_df["ROS"] = (demand_df[C6["qty_7d"]] / 7.0).round(2)
+    demand_df["CVD"] = (
+        demand_df["Store_Final_Available_Qty"] / demand_df["ROS"].replace(0, float("nan"))
+    ).round(1)
+
+    # --- WH Avl. / WH+GIT: NOT repeated on every store row anymore. Shown only
+    # once per AG, on a dedicated SITE=9950 row appended at the end. ---
+    store_rows = demand_df.rename(columns={
+        C["site"]: "Site",
+        "AG_Mapped": "Subclass_Desc",
+        C2["final_mbq"]: "MBQ",
+        C2["final_vt"]: "VT",
+        "VT_Pct": "VT%",
+        "Store_Final_Available_Qty": "Site MBQ",
+        "PACK_Qty_Representative": "PACK_Qty",
+        C6["sales_7d"]: "Sales_L7D",
+        C6["qty_7d"]: "Qty_SLD_L7D",
+        "Has_SOH_Presence": "Stock Present in SOH (Y/N)",
+    }).copy()
+    store_rows["Stock Present in SOH (Y/N)"] = store_rows["Stock Present in SOH (Y/N)"].map({True: "Y", False: "N"})
+    store_rows["WH Avl."] = ""   # blank on store rows -- see WH pseudo-rows below
+    store_rows["WH+GIT"] = ""
+    store_rows = store_rows[[
+        "Site", "Site_Desc", "Subclass_Desc", "MBQ", "VT", "VT%", "Avl_MBQ_Fill_Pct",
+        "WH Avl.", "WH+GIT", "Site MBQ", "PACK_Qty", "Sales_L7D", "Qty_SLD_L7D", "ROS", "CVD",
+        "Stock Present in SOH (Y/N)",
+    ]].rename(columns={"Avl_MBQ_Fill_Pct": "Avl.MBQ Fill%"})
+
+    # WH pseudo-rows: one per AG, SITE=9950, carrying WH Avl./WH+GIT only
+    wh_site_desc = wh_df[C["site_desc"]].iloc[0] if len(wh_df) else "EB-RDC-South-Bengaluru"
+    wh_ag_full = pd.DataFrame({"AG_Mapped": sorted(official_ags)}).merge(wh_ag, on="AG_Mapped", how="left")
+    wh_ag_full["WH_Final_Available_Qty"] = wh_ag_full["WH_Final_Available_Qty"].fillna(0)
+    wh_ag_full["WH_Final_GIT_Qty"] = wh_ag_full["WH_Final_GIT_Qty"].fillna(0)
+    wh_ag_full = wh_ag_full.merge(ag_pack_df[["AG_Mapped", "PACK_Qty_Representative"]], on="AG_Mapped", how="left")
+    wh_ag_full["PACK_Qty_Representative"] = wh_ag_full["PACK_Qty_Representative"].fillna(1)
+
+    wh_rows = pd.DataFrame({
+        "Site": WH_SITE_CODE,
+        "Site_Desc": wh_site_desc,
+        "Subclass_Desc": wh_ag_full["AG_Mapped"],
+        "MBQ": "", "VT": "", "VT%": "", "Avl.MBQ Fill%": "",
+        "WH Avl.": wh_ag_full["WH_Final_Available_Qty"],
+        "WH+GIT": wh_ag_full["WH_Final_Available_Qty"] + wh_ag_full["WH_Final_GIT_Qty"],
+        "Site MBQ": "", "PACK_Qty": wh_ag_full["PACK_Qty_Representative"],
+        "Sales_L7D": "", "Qty_SLD_L7D": "", "ROS": "", "CVD": "",
+        "Stock Present in SOH (Y/N)": "",
+    })
+
+    output2 = pd.concat([store_rows, wh_rows], ignore_index=True)
+    output2.to_excel(paths["output2"], sheet_name="Detail", index=False)
+    log.append(f"STEP 21a: Output-2 Detail sheet written — {len(store_rows):,} store rows + "
+               f"{len(wh_rows):,} WH (SITE {WH_SITE_CODE}) summary rows appended at the end, "
+               f"one per AG. WH Avl./WH+GIT no longer repeated on every store row.")
+
+    # ---- Overall aggregate KPIs ----
+    has_target = demand_df[C2["final_mbq"]].notna()
+    overall_vt_pct = (
+        demand_df.loc[has_target, "VT_Available"].sum() / demand_df.loc[has_target, C2["final_vt"]].sum()
+    ) if demand_df.loc[has_target, C2["final_vt"]].sum() > 0 else 0
+    overall_mbq_before = (
+        demand_df.loc[has_target, "Store_Final_Available_Qty"].sum() / demand_df.loc[has_target, C2["final_mbq"]].sum()
+    ) if demand_df.loc[has_target, C2["final_mbq"]].sum() > 0 else 0
+    overall_mbq_after = (
+        (demand_df.loc[has_target, "Store_Final_Available_Qty"] + demand_df.loc[has_target, "Allocated_Qty"]).sum()
+        / demand_df.loc[has_target, C2["final_mbq"]].sum()
+    ) if demand_df.loc[has_target, C2["final_mbq"]].sum() > 0 else 0
+    total_order_qty = demand_df["Allocated_Qty"].sum()
+
+    summary_kpis = pd.DataFrame({
+        "Metric": [
+            "Total Order Qty Generated (units)",
+            "Overall VT% (all Store+AG rows with a target)",
+            "Overall MBQ% — Before Order",
+            "Overall MBQ% — After Order",
+            "Input-6 Qty excluded (store has sales but no rank in Input-4)",
+            "Input-6 Qty unexplained difference (should be 0)",
+        ],
+        "Value": [
+            f"{total_order_qty:,.0f}", f"{overall_vt_pct:.1%}", f"{overall_mbq_before:.1%}",
+            f"{overall_mbq_after:.1%}", f"{excl_qty:,.0f}", f"{recon_diff:,.0f}",
+        ],
+    })
+    with pd.ExcelWriter(paths["output2"], mode="a", engine="openpyxl") as xw:
+        summary_kpis.to_excel(xw, sheet_name="Summary", index=False)
+
+    log.append("-" * 78)
+    log.append("OVERALL AGGREGATE METRICS (also written to Output-2's 'Summary' sheet)")
+    log.append(f"  Total Order Qty Generated:     {total_order_qty:,.0f} units")
+    log.append(f"  Overall VT%:                   {overall_vt_pct:.1%}")
+    log.append(f"  Overall MBQ% (Before Order):   {overall_mbq_before:.1%}")
+    log.append(f"  Overall MBQ% (After Order):    {overall_mbq_after:.1%}")
+    log.append(f"STEP 21b: Output-2 written (Detail + WH rows + Summary sheet) -> {paths['output2']}")
+
+    # ---- STEP 22: Exceptions report ----
+    with pd.ExcelWriter(paths["exceptions"]) as xw:
+        readme = pd.DataFrame({
+            "Sheet": ["Unranked Stores", "Unmapped AG Names (data-quality)", "Zero-Stock Store+AG Combos",
+                      "No Target in Input-2", "Input-6 Sales Excluded",
+                      "PACK_QTY Inconsistencies", "Unfillable Gaps",
+                      "NSO Blocked Stock (Location 40)", "WH Storage Location Breakdown"],
+            "What it means": [
+                "Store codes found in SOH but with NO rank in Input-4 -- excluded from the whole "
+                "analysis (not-yet-opened or closing store).",
+                "SOH rows whose SUBCLASS_DESC text did NOT match the official 52-AG list after "
+                "normalization -- a NAME/SPELLING problem, e.g. junk or unrecognized AG labels. "
+                "This is DIFFERENT from a store simply not carrying an AG (see next sheet).",
+                "Active Store+AG combinations with ZERO SOH presence at all (no stock, GIT, or "
+                "TSF_Expected for any Article) -- this is the correct place to check your "
+                "'space-crunch, AG deliberately not carried at this store' question. These rows "
+                "ARE still included in Output-2 (as zero rows, flagged 'Stock Present in SOH'=N) "
+                "so the true gap size is visible -- they are listed here again just as a quick "
+                "filtered view.",
+                "Active Store+AG combinations that have NO row in Input-2 (no VT/MBQ target). "
+                "This is the closest signal for 'this AG is not planned for this store' (e.g. space "
+                "crunch). Output-2 shows blank MBQ/VT for these and no order is raised for them.",
+                "Input-6 sales rows for stores that have NO rank in Input-4 (outside the active-store "
+                "scope). Sales exist, so check whether these stores should be added to Input-4.",
+                "AGs where more than one PACK_QTY value appears on a row that ACTUALLY HOLDS STOCK -- "
+                "the value from the stock-holding row with the most stock is used as the "
+                "representative PACK_Qty; review for data-entry errors.",
+                "Store+AG rows with a real MBQ gap that could not be (fully) filled, with the reason.",
+                f"Stock sitting under STORAGE_LOCATION_ID={NSO_BLOCKED_STORAGE_LOCATION} -- "
+                "blocked/reserved for NSO (New Store Opening) or upcoming new stores. NEVER counted "
+                "as available WH stock anywhere else in this pipeline. Shown at Site+AG grain.",
+                "How much WH (SITE 9950) stock sits in EVERY storage location, for transparency on "
+                f"where the 'WH Avl.' total comes from. Only STORAGE_LOCATION_ID="
+                f"{WH_AVAILABLE_STORAGE_LOCATION} is counted as genuinely available; every other "
+                "row here (NSO-blocked, Online, Lot Sale, EOSS, etc.) is excluded from WH Avl./WH+GIT "
+                "and from the order-raising engine.",
+            ],
+        })
+        readme.to_excel(xw, sheet_name="README", index=False)
+
+        pd.DataFrame({"Dropped Store Code (no rank in Input-4)": sorted(dropped_stores)}).to_excel(
+            xw, sheet_name="Unranked Stores", index=False)
+        unmapped_ags = soh_df[soh_df["AG_Mapped"].isna()][[C["site"], C["subclass"]]].drop_duplicates()
+        unmapped_ags.to_excel(xw, sheet_name="Unmapped AG Names", index=False)
+
+        zero_stock = demand_df[~demand_df["Has_SOH_Presence"]][[C["site"], "AG_Mapped"]].rename(
+            columns={C["site"]: "Store Code", "AG_Mapped": "AG"})
+        zero_stock.to_excel(xw, sheet_name="Zero-Stock Store+AG Combos", index=False)
+
+        no_target = demand_df[demand_df[C2["final_mbq"]].isna()][[C["site"], "AG_Mapped"]].rename(
+            columns={C["site"]: "Store Code", "AG_Mapped": "AG"})
+        no_target.to_excel(xw, sheet_name="No Target in Input-2", index=False)
+        input6_excluded.to_excel(xw, sheet_name="Input-6 Sales Excluded", index=False)
+
+        unfillable_df.to_excel(xw, sheet_name="Unfillable Gaps", index=False)
+        pack_inconsistent_df.to_excel(xw, sheet_name="PACK_QTY Inconsistencies", index=False)
+        nso_blocked_df.to_excel(xw, sheet_name="NSO Blocked Stock (Loc 40)", index=False)
+        wh_loc_breakdown.to_excel(xw, sheet_name="WH Storage Location Breakdown", index=False)
+    log.append(f"STEP 22: Exceptions report written (with a README sheet explaining each tab) -> {paths['exceptions']}")
+
+    # ---- DATA QUALITY ERRORS SUMMARY ----
+    n_missing_target = demand_df[C2["final_mbq"]].isna().sum()
+    n_zero_stock = (~demand_df["Has_SOH_Presence"]).sum()
+    log.append("-" * 78)
+    log.append("DATA QUALITY ERRORS SUMMARY (see Exceptions_Report for full detail, incl. a README sheet)")
+    log.append(f"  Stores dropped (no rank in Input-4):           {len(dropped_stores)}")
+    log.append(f"  SOH rows with unmapped AG name (spelling issue): {(soh_df['AG_Mapped'].isna()).sum():,}")
+    log.append(f"  Active Store+AG combos with ZERO SOH presence:  {n_zero_stock:,} "
+               f"(store genuinely not carrying / sold out of that AG -- review if unintended)")
+    log.append(f"  AGs with inconsistent PACK_QTY across Articles: {len(pack_inconsistent_df)} "
+               f"({pack_inconsistent_df['Has_Suspicious_Outlier'].sum()} include a suspicious outlier value)")
+    log.append(f"  Store+AG rows with no VT/MBQ target in Input-2: {int(n_missing_target):,}")
+    log.append(f"  Store+AG gaps that could not be fully filled:   {len(unfillable_df):,}")
+    log.append(f"  WH stock blocked for NSO (Location {NSO_BLOCKED_STORAGE_LOCATION}): "
+               f"{nso_blocked_df['Blocked_Available_Qty'].sum():,.0f} units across "
+               f"{len(nso_blocked_df):,} Site+AG combos -- excluded from WH Avl. everywhere")
+
+    # ---- Summary ----
+    total_gap_before = demand_df["MBQ_Gap"].sum()
+    total_gap_after = (demand_df["Effective_MBQ"] - demand_df["New_Effective_Position"]).clip(lower=0).sum()
+    log.append("-" * 78)
+    log.append("RUN SUMMARY")
+    log.append(f"  Store+AG rows evaluated:      {len(demand_df):,}")
+    log.append(f"  Rows with a real MBQ gap:     {(demand_df['MBQ_Gap']>0).sum():,}")
+    log.append(f"  Total gap (units) BEFORE:     {total_gap_before:,.0f}")
+    log.append(f"  Total gap (units) AFTER order:{total_gap_after:,.0f}")
+    log.append(f"  Order lines raised:           {len(output1):,}")
+    log.append(f"  Total units ordered:          {output1['Order Qty'].sum() if not output1.empty else 0:,.0f}")
+    log.append(f"  Unfillable Store+AG rows:     {len(unfillable_df):,} (see Exceptions report)")
+    log.append(f"  Run time: {time.time()-t0:.1f}s")
+    log.append("=" * 78)
+
+    with open(paths["run_log"], "w") as f:
+        f.write("\n".join(log))
+    for line in log[-14:]:
+        print(line)
+
+    return output1, output2, demand_df
+
+
+if __name__ == "__main__":
+    run()
