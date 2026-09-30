@@ -943,6 +943,7 @@ def run(input_dir=INPUT_DIR, output_dir=OUTPUT_DIR, run_date=None):
         C2["final_vt"]: "VT",
         "VT_Pct": "VT%",
         "Store_Final_Available_Qty": "Site MBQ",
+        "Store_Final_GIT_Qty": "Site GIT",
         "PACK_Qty_Representative": "PACK_Qty",
         C6["sales_7d"]: "Sales_L7D",
         C6["qty_7d"]: "Qty_SLD_L7D",
@@ -953,7 +954,7 @@ def run(input_dir=INPUT_DIR, output_dir=OUTPUT_DIR, run_date=None):
     store_rows["WH+GIT"] = ""
     store_rows = store_rows[[
         "Site", "Site_Desc", "Subclass_Desc", "MBQ", "VT", "VT%", "Avl_MBQ_Fill_Pct",
-        "WH Avl.", "WH+GIT", "Site MBQ", "PACK_Qty", "Sales_L7D", "Qty_SLD_L7D", "ROS", "CVD",
+        "WH Avl.", "WH+GIT", "Site MBQ", "Site GIT", "PACK_Qty", "Sales_L7D", "Qty_SLD_L7D", "ROS", "CVD",
         "Stock Present in SOH (Y/N)",
     ]].rename(columns={"Avl_MBQ_Fill_Pct": "Avl.MBQ Fill%"})
 
@@ -972,7 +973,7 @@ def run(input_dir=INPUT_DIR, output_dir=OUTPUT_DIR, run_date=None):
         "MBQ": "", "VT": "", "VT%": "", "Avl.MBQ Fill%": "",
         "WH Avl.": wh_ag_full["WH_Final_Available_Qty"],
         "WH+GIT": wh_ag_full["WH_Final_Available_Qty"] + wh_ag_full["WH_Final_GIT_Qty"],
-        "Site MBQ": "", "PACK_Qty": wh_ag_full["PACK_Qty_Representative"],
+        "Site MBQ": "", "Site GIT": "", "PACK_Qty": wh_ag_full["PACK_Qty_Representative"],
         "Sales_L7D": "", "Qty_SLD_L7D": "", "ROS": "", "CVD": "",
         "Stock Present in SOH (Y/N)": "",
     })
