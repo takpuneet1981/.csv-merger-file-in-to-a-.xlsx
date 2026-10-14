@@ -78,6 +78,26 @@ EXCLUDED_WH_CODES = [9951, 9952]         # explicitly not for Accessories
 STORE_CODE_PATTERN = r"^5\d{3}$"         # stores are 4-digit codes starting with 5
 
 # ---------------------------------------------------------------------------
+# SEASON RULE FOR OUTPUT-1 (HARD-CODED until the business says otherwise)
+# ---------------------------------------------------------------------------
+# Orders in Output-1 may ONLY be raised from warehouse stock belonging to these
+# seasons. Stock of any other season (NOS-24, NOS-23, "NOS 22 Prior", "SS 22
+# Prior", S5-26, sample-sale lots, or any new/unknown season) is never sent to
+# stores. Matching ignores case, spaces and hyphens, so "NOS - 27" and "NOS-27"
+# are treated as the same season. To change the rule, edit this list.
+ALLOWED_ORDER_SEASONS = ["NOS-25", "NOS-26", "NOS-27"]
+
+
+def normalize_season(raw):
+    """'NOS - 27' / 'nos-27' / 'NOS 27' -> 'NOS27' (letters+digits only)."""
+    return re.sub(r"[^A-Z0-9]", "", str(raw).upper())
+
+
+def is_allowed_season(raw):
+    return normalize_season(raw) in {normalize_season(x) for x in ALLOWED_ORDER_SEASONS}
+
+
+# ---------------------------------------------------------------------------
 # AG (SUBCLASS_DESC) NORMALIZATION
 # ---------------------------------------------------------------------------
 AG_PREFIX_TO_STRIP = "ACC "
@@ -548,6 +568,13 @@ def aggregate_wh_article(wh_df, log):
     valid = wh_df[
         (wh_df["AG_Mapped"].notna()) & (wh_df[C["storage_location"]] == WH_AVAILABLE_STORAGE_LOCATION)
     ].copy()
+
+    # SEASON RULE: only ALLOWED_ORDER_SEASONS stock may be ordered to stores.
+    season_ok = valid[C["season"]].apply(is_allowed_season)
+    units_before = valid["Final_Available_Qty"].sum()
+    units_excluded = valid.loc[~season_ok, "Final_Available_Qty"].sum()
+    valid = valid[season_ok]
+
     wh_article = (
         valid.groupby([C["article"], "AG_Mapped", C["style"], C["colour"], C["size"], C["season"]])
         .agg(WH_Final_Available_Qty=("Final_Available_Qty", "sum"))
@@ -557,7 +584,31 @@ def aggregate_wh_article(wh_df, log):
     log.append(f"STEP 12: WH Article-level stock pool built — {len(wh_article):,} Article lines "
                f"with available stock at SITE {WH_SITE_CODE}, STORAGE_LOCATION_ID="
                f"{WH_AVAILABLE_STORAGE_LOCATION} only")
+    log.append(f"STEP 12-S: SEASON RULE applied to the order pool — only {ALLOWED_ORDER_SEASONS} may be "
+               f"ordered. Of {units_before:,.0f} available WH units, {units_before-units_excluded:,.0f} "
+               f"are in allowed seasons (orderable) and {units_excluded:,.0f} are in other seasons "
+               f"(held back, see Exceptions sheet 'WH Stock by Season').")
     return wh_article
+
+
+def analyze_wh_seasons(wh_df, log):
+    """Diagnostic: available WH stock (Location 10) by season, with a flag showing
+    whether that season is allowed to be ordered under the hard-coded season rule."""
+    valid = wh_df[
+        (wh_df["AG_Mapped"].notna()) & (wh_df[C["storage_location"]] == WH_AVAILABLE_STORAGE_LOCATION)
+    ].copy()
+    by_season = (
+        valid.groupby(C["season"], dropna=False)
+        .agg(Rows=("Final_Available_Qty", "size"), WH_Final_Available_Qty=("Final_Available_Qty", "sum"))
+        .reset_index()
+        .sort_values("WH_Final_Available_Qty", ascending=False)
+    )
+    by_season["Allowed to Order (Y/N)"] = by_season[C["season"]].apply(
+        lambda x: "Y" if is_allowed_season(x) else "N")
+    held = by_season.loc[by_season["Allowed to Order (Y/N)"] == "N", "WH_Final_Available_Qty"].sum()
+    log.append(f"STEP 12-T: WH available stock by season — {len(by_season)} season labels found; "
+               f"{held:,.0f} units sit in seasons that are NOT allowed to be ordered")
+    return by_season
 
 
 def analyze_wh_storage_locations(wh_df, log):
@@ -653,6 +704,7 @@ for REPLENISHMENT ONLY (existing Articles at a store — no new-option lines).
 Waterfall order:
   1. Store Priority Rank (ascending — rank 1 served first)
   2. AG Priority Rank (ascending, within a store)
+  0. ONLY warehouse stock of ALLOWED_ORDER_SEASONS is eligible to be ordered.
   3. Within a Store+AG, existing Articles are prioritized:
        a) Articles with Available SOH > 0 at that store (top up what's alive)
        b) then by latest Season (NOS-26 before NOS-25, etc.)
@@ -706,8 +758,15 @@ def allocate(demand_df, store_article_df, wh_article_df, log):
     """Returns (order_lines_df, updated_demand_df_with_fill_results, unfillable_df)."""
     C4 = INPUT4_COLS
 
-    # WH remaining pool, keyed by Article — will be decremented as we allocate
-    wh_pool = wh_article_df.set_index(C["article"])["WH_Final_Available_Qty"].to_dict()
+    # WH remaining pool, keyed by Article. Each Article holds a list of [season, qty]
+    # "lots" (normally exactly one), newest season first, so that an Article carrying
+    # stock in two seasons can never have one lot silently overwrite the other.
+    wh_pool = {}
+    _pool_src = wh_article_df.assign(_rank=wh_article_df[C["season"]].apply(_season_recency_key)) \
+                             .sort_values("_rank", ascending=False)
+    for _art, _season, _qty in zip(_pool_src[C["article"]], _pool_src[C["season"]],
+                                   _pool_src["WH_Final_Available_Qty"]):
+        wh_pool.setdefault(_art, []).append([_season, _qty])
 
     # existing Articles per Store+AG (replenishment candidates)
     store_article_df = store_article_df.copy()
@@ -741,25 +800,29 @@ def allocate(demand_df, store_article_df, wh_article_df, log):
             if remaining_gap <= 0:
                 break
             article = art_row[C["article"]]
-            wh_avail = wh_pool.get(article, 0)
-            if wh_avail <= 0:
-                continue
-            alloc_qty = min(remaining_gap, wh_avail)
-            if alloc_qty <= 0:
-                continue
-            order_lines.append({
-                C["site"]: site,
-                C["article"]: article,
-                "AG": ag,
-                "Allocated_Qty": alloc_qty,
-            })
-            wh_pool[article] = wh_avail - alloc_qty
-            remaining_gap -= alloc_qty
+            for lot in wh_pool.get(article, []):
+                if remaining_gap <= 0:
+                    break
+                wh_avail = lot[1]
+                if wh_avail <= 0:
+                    continue
+                alloc_qty = min(remaining_gap, wh_avail)
+                if alloc_qty <= 0:
+                    continue
+                order_lines.append({
+                    C["site"]: site,
+                    C["article"]: article,
+                    "AG": ag,
+                    "Season": lot[0],
+                    "Allocated_Qty": alloc_qty,
+                })
+                lot[1] = wh_avail - alloc_qty
+                remaining_gap -= alloc_qty
 
         if remaining_gap > 0:
             unfillable.append({
                 C["site"]: site, "AG": ag, "MBQ_Gap": gap,
-                "Reason": f"WH stock exhausted for existing Articles — {int(remaining_gap)} units short"
+                "Reason": f"WH stock exhausted for existing Articles (allowed seasons only: {', '.join(ALLOWED_ORDER_SEASONS)}) — {int(remaining_gap)} units short"
             })
 
     order_df = pd.DataFrame(order_lines)
@@ -829,6 +892,7 @@ def run(input_dir=INPUT_DIR, output_dir=OUTPUT_DIR, run_date=None):
     wh_article = aggregate_wh_article(wh_df, log)
     wh_ag = aggregate_wh_ag(wh_df, log)
     wh_loc_breakdown = analyze_wh_storage_locations(wh_df, log)
+    wh_season_df = analyze_wh_seasons(wh_df, log)
     nso_blocked_df = analyze_nso_blocked_stock(soh_df, log)
 
     # ---- STEP 13-15: Priority, Effective MBQ, sales cleanup ----
@@ -908,9 +972,9 @@ def run(input_dir=INPUT_DIR, output_dir=OUTPUT_DIR, run_date=None):
     if not order_df.empty:
         order_df["Store Name"] = order_df[C["site"]].map(store_name_map)
         output1 = order_df.rename(columns={C["site"]: "Store Code", C["article"]: "Article", "Allocated_Qty": "Order Qty"})
-        output1 = output1[["Store Code", "Store Name", "Article", "AG", "Order Qty"]]
+        output1 = output1[["Store Code", "Store Name", "Article", "AG", "Season", "Order Qty"]]
     else:
-        output1 = pd.DataFrame(columns=["Store Code", "Store Name", "Article", "AG", "Order Qty"])
+        output1 = pd.DataFrame(columns=["Store Code", "Store Name", "Article", "AG", "Season", "Order Qty"])
     output1.to_excel(paths["output1"], index=False)
     log.append(f"STEP 20: Output-1 (Replenishment Order File) written — {len(output1):,} order lines "
                f"-> {paths['output1']}")
@@ -1030,7 +1094,8 @@ def run(input_dir=INPUT_DIR, output_dir=OUTPUT_DIR, run_date=None):
             "Sheet": ["Unranked Stores", "Unmapped AG Names (data-quality)", "Zero-Stock Store+AG Combos",
                       "No Target in Input-2", "Input-6 Sales Excluded",
                       "PACK_QTY Inconsistencies", "Unfillable Gaps",
-                      "NSO Blocked Stock (Location 40)", "WH Storage Location Breakdown"],
+                      "NSO Blocked Stock (Location 40)", "WH Storage Location Breakdown",
+                      "WH Stock by Season"],
             "What it means": [
                 "Store codes found in SOH but with NO rank in Input-4 -- excluded from the whole "
                 "analysis (not-yet-opened or closing store).",
@@ -1060,6 +1125,10 @@ def run(input_dir=INPUT_DIR, output_dir=OUTPUT_DIR, run_date=None):
                 f"{WH_AVAILABLE_STORAGE_LOCATION} is counted as genuinely available; every other "
                 "row here (NSO-blocked, Online, Lot Sale, EOSS, etc.) is excluded from WH Avl./WH+GIT "
                 "and from the order-raising engine.",
+                f"Available WH stock (Location 10) by SEASON. Output-1 may only be raised from "
+                f"{ALLOWED_ORDER_SEASONS} (hard-coded rule, matched ignoring case/spaces/hyphens); "
+                "seasons marked 'N' are held back and never ordered to stores. Check here for any new "
+                "season label that appears in the data -- it will be held back until the rule is updated.",
             ],
         })
         readme.to_excel(xw, sheet_name="README", index=False)
@@ -1082,6 +1151,7 @@ def run(input_dir=INPUT_DIR, output_dir=OUTPUT_DIR, run_date=None):
         pack_inconsistent_df.to_excel(xw, sheet_name="PACK_QTY Inconsistencies", index=False)
         nso_blocked_df.to_excel(xw, sheet_name="NSO Blocked Stock (Loc 40)", index=False)
         wh_loc_breakdown.to_excel(xw, sheet_name="WH Storage Location Breakdown", index=False)
+        wh_season_df.to_excel(xw, sheet_name="WH Stock by Season", index=False)
     log.append(f"STEP 22: Exceptions report written (with a README sheet explaining each tab) -> {paths['exceptions']}")
 
     # ---- DATA QUALITY ERRORS SUMMARY ----
