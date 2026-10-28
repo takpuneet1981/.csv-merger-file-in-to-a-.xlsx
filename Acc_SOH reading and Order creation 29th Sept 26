@@ -16,6 +16,7 @@ import tempfile
 import time
 import numpy as np
 import pandas as pd
+from openpyxl.styles import PatternFill, Font, Alignment
 
 
 
@@ -98,6 +99,14 @@ def is_allowed_season(raw):
 
 
 # ---------------------------------------------------------------------------
+# UNRANKED-STORE ALERT: a store that holds stock in SOH but is missing from
+# Input-4 is flagged in the Exceptions report; if its stock position (available
+# on hand + in-transit GIT + TSF expected) is MORE than this many units it is
+# highlighted in red as an ALERT.
+# ---------------------------------------------------------------------------
+UNRANKED_STORE_STOCK_ALERT_QTY = 2000
+
+# ---------------------------------------------------------------------------
 # AG (SUBCLASS_DESC) NORMALIZATION
 # ---------------------------------------------------------------------------
 AG_PREFIX_TO_STRIP = "ACC "
@@ -164,6 +173,16 @@ SOH_COLS = {
     "git_qty": "GIT_QTY",
     "tsf_expected_qty": "TSF_EXPECTED_QTY",
     "storage_location": "STORAGE_LOCATION_ID",
+}
+
+# Descriptive store attributes used only for reporting (never for any calculation).
+# If one of them is missing from a future SOH file the run continues and the
+# related report field is simply left blank (a warning is logged).
+OPTIONAL_SOH_COLS = {
+    "area": "AREA_NAME",          # same grouping as Input-4's New_Region (e.g. "EB KA and Goa")
+    "region": "REGION_NAME",      # state-level region (e.g. "Karnataka")
+    "city": "CITY",
+    "site_status": "SITE_STATUS", # Active / Inactive as recorded in SOH
 }
 
 INPUT2_COLS = {
@@ -262,7 +281,9 @@ def load_soh(input_dir, log):
         raise FileNotFoundError(f"No readable CSV files found among SOH files in {input_dir}")
 
     _log(log, f"STEP 1b: Reading {len(csv_paths)} CSV file(s)...")
-    needed_cols = list(SOH_COLS.values())
+    required_cols = list(SOH_COLS.values())
+    optional_cols = list(OPTIONAL_SOH_COLS.values())
+    needed_cols = required_cols + optional_cols
     frames = []
     for p in csv_paths:
         d = pd.read_csv(p, usecols=lambda c: c in needed_cols, low_memory=False)
@@ -272,9 +293,13 @@ def load_soh(input_dir, log):
     df = pd.concat(frames, ignore_index=True)
     _log(log, f"STEP 1c: Combined SOH shape = {df.shape[0]:,} rows x {df.shape[1]} cols")
 
-    missing_cols = [c for c in needed_cols if c not in df.columns]
+    missing_cols = [c for c in required_cols if c not in df.columns]
     if missing_cols:
         raise ValueError(f"SOH files are missing expected columns: {missing_cols}")
+    for oc in optional_cols:
+        if oc not in df.columns:
+            _log(log, f"   WARNING: optional SOH column '{oc}' not found -- the related report field will be blank")
+            df[oc] = ""
 
     return df
 
@@ -466,11 +491,12 @@ def apply_store_scope(store_df, input4_df, log):
     scoped = store_df[store_df[C["site"]].isin(active_stores)].copy()
     log.append(f"STEP 10: Store scope filter — {before} stores in SOH, "
                f"{scoped[C['site']].nunique()} kept (ranked in Input-4), "
-               f"{len(dropped)} dropped (not-yet-open or closing): {dropped}")
+               f"{len(dropped)} are NOT ranked in Input-4: {[int(x) for x in dropped]}. They get no orders; any that hold "
+               f"stock are still listed in Output-2 and in the Exceptions report sheet 'Unranked Stores'.")
     return scoped, dropped
 
 
-def aggregate_store_ag(store_df, active_stores, official_ags, log):
+def aggregate_store_ag(store_df, store_order, official_ags, log, n_unranked=0):
     """
     Builds the FULL universe of (active store x official AG) combinations
     first, then left-merges actual SOH-derived aggregates onto it. This
@@ -481,7 +507,7 @@ def aggregate_store_ag(store_df, active_stores, official_ags, log):
     rows actually had stock data vs. were filled in as zero.
     """
     universe = pd.DataFrame(
-        [(s, a) for s in sorted(active_stores) for a in sorted(official_ags)],
+        [(s, a) for s in store_order for a in sorted(official_ags)],
         columns=[C["site"], "AG_Mapped"],
     )
 
@@ -526,7 +552,8 @@ def aggregate_store_ag(store_df, active_stores, official_ags, log):
 
     n_zero_stock = (~universe["Has_SOH_Presence"]).sum()
     log.append(f"STEP 11: Store+AG UNIVERSE built as a full cross-join of "
-               f"{len(active_stores)} active stores x {len(official_ags)} official AGs "
+               f"{len(store_order)} stores ({len(store_order)-n_unranked} ranked in Input-4 + {n_unranked} "
+               f"unranked stores holding stock) x {len(official_ags)} official AGs "
                f"= {len(universe):,} rows. {n_zero_stock:,} of these combinations have "
                f"ZERO SOH presence (no stock/GIT/TSF at all for that store+AG) — kept in the "
                f"report as zero rows (flagged 'Has_SOH_Presence'=False), not dropped, so nothing "
@@ -650,6 +677,138 @@ def analyze_nso_blocked_stock(soh_df, log):
     return blocked
 
 
+def analyze_unranked_stores(store_all_df, active_stores, input2_df, input6_df, log):
+    """Every store found in SOH that has NO rank in Input-4, with everything needed to decide
+    whether Input-4 should be corrected: name, region, state, city, status, stock position and
+    last-7-day sales. Stores holding more than UNRANKED_STORE_STOCK_ALERT_QTY units of available
+    stock are flagged ALERT. Returns (report_df, list_of_unranked_stores_holding_stock)."""
+    cols = ["Store Code", "Store Name", "Region (SOH AREA_NAME)", "State (SOH REGION_NAME)", "City",
+            "Site Status (in SOH)", "Available Stock (units)", "GIT (units)", "TSF Expected (units)",
+            "Stock Position (units)", "Articles With Stock", "AGs With Stock", "Qty Sold L7D (Input-6)", "Sales L7D (Input-6)",
+            "Has Targets in Input-2 (Y/N)", "Alert"]
+    un = store_all_df[~store_all_df[C["site"]].isin(set(active_stores))].copy()
+    if un.empty:
+        log.append("STEP 10b: Every store found in SOH is ranked in Input-4 (no unranked stores).")
+        return pd.DataFrame(columns=cols), []
+
+    def _mode(s):
+        s = s.dropna().astype(str).str.strip()
+        s = s[s != ""]
+        return s.value_counts().index[0] if len(s) else ""
+
+    def _status(s):
+        return " / ".join(sorted({str(v).strip() for v in s.dropna() if str(v).strip()}))
+
+    O = OPTIONAL_SOH_COLS
+    g = un.groupby(C["site"]).agg(**{
+        "Store Name": (C["site_desc"], _mode),
+        "Region (SOH AREA_NAME)": (O["area"], _mode),
+        "State (SOH REGION_NAME)": (O["region"], _mode),
+        "City": (O["city"], _mode),
+        "Site Status (in SOH)": (O["site_status"], _status),
+        "Available Stock (units)": ("Final_Available_Qty", "sum"),
+        "GIT (units)": ("Final_GIT_Qty", "sum"),
+        "TSF Expected (units)": ("Final_TSF_Expected_Qty", "sum"),
+    }).reset_index().rename(columns={C["site"]: "Store Code"})
+
+    holding = un[un["Final_Available_Qty"] > 0]
+    g["Articles With Stock"] = g["Store Code"].map(holding.groupby(C["site"])[C["article"]].nunique()).fillna(0).astype(int)
+    g["AGs With Stock"] = g["Store Code"].map(holding.groupby(C["site"])[C["subclass"]].nunique()).fillna(0).astype(int)
+
+    sales = input6_df.groupby(INPUT6_COLS["store"])[[INPUT6_COLS["qty_7d"], INPUT6_COLS["sales_7d"]]].sum()
+    g["Qty Sold L7D (Input-6)"] = g["Store Code"].map(sales[INPUT6_COLS["qty_7d"]]).fillna(0)
+    g["Sales L7D (Input-6)"] = g["Store Code"].map(sales[INPUT6_COLS["sales_7d"]]).fillna(0)
+    in_i2 = set(input2_df[INPUT2_COLS["store"]].unique())
+    g["Has Targets in Input-2 (Y/N)"] = g["Store Code"].apply(lambda x: "Y" if x in in_i2 else "N")
+
+    for c in ["Available Stock (units)", "GIT (units)", "TSF Expected (units)",
+              "Qty Sold L7D (Input-6)", "Sales L7D (Input-6)"]:
+        g[c] = g[c].round(0).astype(int)
+
+    # Stock position = what the store holds (on hand) + what is on its way (GIT) + what is already
+    # ordered towards it (TSF expected). The alert uses the full position so a store that is about to
+    # receive a large quantity is not missed just because its shelves are still empty.
+    g["Stock Position (units)"] = g["Available Stock (units)"] + g["GIT (units)"] + g["TSF Expected (units)"]
+
+    def _alert(r):
+        pos = r["Stock Position (units)"]
+        if pos > UNRANKED_STORE_STOCK_ALERT_QTY:
+            return (f"ALERT: stock position {pos:,} units (on hand {r['Available Stock (units)']:,} + in transit "
+                    f"{r['GIT (units)']:,} + expected {r['TSF Expected (units)']:,}) is more than "
+                    f"{UNRANKED_STORE_STOCK_ALERT_QTY:,} but the store is MISSING from Input-4")
+        if pos > 0:
+            return "Holds stock but missing from Input-4 (shown in Output-2, no orders raised)"
+        return "No stock in SOH - missing from Input-4 (not shown in Output-2)"
+    g["Alert"] = g.apply(_alert, axis=1)
+
+    level = g["Alert"].map(lambda a: 0 if a.startswith("ALERT") else 1 if a.startswith("Holds") else 2)
+    g = g.assign(_lvl=level).sort_values(["_lvl", "Stock Position (units)"], ascending=[True, False]).drop(columns="_lvl")
+
+    hold_list = [int(x) for x in g.loc[g["Alert"].str.startswith(("ALERT", "Holds")), "Store Code"]]
+    alerts = g[g["Alert"].str.startswith("ALERT")]
+    log.append(f"STEP 10b: {len(g)} store(s) in SOH are NOT ranked in Input-4; {len(hold_list)} of them hold or "
+               f"are receiving stock (these are added to Output-2, flagged 'Store in Input-4'=N, and get no orders).")
+    if len(alerts):
+        log.append(f"   *** ALERT: {len(alerts)} store(s) have a stock position (on hand + in transit + expected) of MORE than "
+                   f"{UNRANKED_STORE_STOCK_ALERT_QTY:,} units but are MISSING from Input-4: " +
+                   ", ".join(f"{int(r['Store Code'])} ({r['Stock Position (units)']:,} units)" for _, r in alerts.iterrows()))
+    else:
+        top = g.sort_values("Stock Position (units)", ascending=False).iloc[0]
+        log.append(f"   No unranked store has a stock position above {UNRANKED_STORE_STOCK_ALERT_QTY:,} units "
+                   f"(highest: store {int(top['Store Code'])} with {top['Stock Position (units)']:,} units).")
+    return g[cols], hold_list
+
+
+def analyze_unmapped_ags(soh_df, log):
+    """Every AG name in SOH (stores + WH 9950) that did NOT match the official AG list, shown with
+    its FULL hierarchy (Division / Group / Department / Class / SubClass), the reason it was not
+    mapped, and how much stock sits under it."""
+    hier = [C["division"], C["group"], C["department"], C["class"], C["subclass"]]
+    out_cols = hier + ["Reason", "SOH Rows", "Stores Holding Stock", "Store Available Stock (units)",
+                       "WH 9950 Available (Loc 10, units)", "Articles"]
+    rel = soh_df[((soh_df[C["site_category"]] == "Store") | (soh_df[C["site"]] == WH_SITE_CODE))
+                 & soh_df["AG_Mapped"].isna()].copy()
+    if rel.empty:
+        log.append("STEP 7c: Every SOH AG name (stores + WH 9950) matched the official AG list.")
+        return pd.DataFrame(columns=out_cols)
+
+    for h in hier:
+        rel[h] = rel[h].fillna("").astype(str).str.strip()
+    never = set(AG_NEVER_AUTOMAP)
+
+    def _reason(raw):
+        if not str(raw).strip():
+            return "Blank SUBCLASS_DESC"
+        if normalize_ag(raw) in never:
+            return "On the never-auto-map list (confirmed a genuinely different product line)"
+        return "No exact match in the official AG list (Input-3) after normalization"
+    rel["Reason"] = rel[C["subclass"]].apply(_reason)
+
+    is_store = rel[C["site_category"]] == "Store"
+    rel["_store_avail"] = np.where(is_store, rel["Final_Available_Qty"], 0.0)
+    rel["_wh_avail"] = np.where((rel[C["site"]] == WH_SITE_CODE) &
+                                (rel[C["storage_location"]] == WH_AVAILABLE_STORAGE_LOCATION),
+                                rel["Final_Available_Qty"], 0.0)
+    rel["_hold_site"] = np.where(is_store & (rel["Final_Available_Qty"] > 0), rel[C["site"]], np.nan)
+
+    res = rel.groupby(hier + ["Reason"]).agg(**{
+        "SOH Rows": (C["article"], "size"),
+        "Stores Holding Stock": ("_hold_site", "nunique"),
+        "Store Available Stock (units)": ("_store_avail", "sum"),
+        "WH 9950 Available (Loc 10, units)": ("_wh_avail", "sum"),
+        "Articles": (C["article"], "nunique"),
+    }).reset_index()
+    for c in ["Store Available Stock (units)", "WH 9950 Available (Loc 10, units)"]:
+        res[c] = res[c].round(0).astype(int)
+    # biggest stock first (store + WH), so unmapped AGs that hold real stock are at the top
+    res = res.assign(_total=res["Store Available Stock (units)"] + res["WH 9950 Available (Loc 10, units)"]) \
+             .sort_values(["_total", "SOH Rows"], ascending=False).drop(columns="_total")
+    log.append(f"STEP 7c: {len(res)} unmapped AG hierarchy combination(s) found in SOH (stores + WH 9950): "
+               f"{int(res['SOH Rows'].sum()):,} SOH rows, {int(res['Store Available Stock (units)'].sum()):,} units "
+               f"sitting in stores under them (see Exceptions sheet 'Unmapped AG Names').")
+    return res[out_cols]
+
+
 def combine_ag_priority(input3_df, log):
     C3 = INPUT3_COLS
     df = input3_df.copy()
@@ -745,6 +904,8 @@ def build_demand(store_agg, effective_mbq_df, store_priority_df, ag_priority_df,
 
     demand = demand.merge(store_priority_df[[C4["store"], C4["rank"]]],
                            left_on=C["site"], right_on=C4["store"], how="left")
+    # A store without an Input-4 rank is reported in Output-2 but is NEVER allocated stock.
+    demand["In_Input4"] = demand[C4["rank"]].notna()
     demand = demand.merge(ag_priority_df.rename(columns={"AG": "AG_Mapped"}),
                            on="AG_Mapped", how="left")
 
@@ -773,7 +934,7 @@ def allocate(demand_df, store_article_df, wh_article_df, log):
     store_article_df["season_rank"] = store_article_df[C["season"]].apply(_season_recency_key)
     store_article_df["has_stock"] = store_article_df["Final_Available_Qty"] > 0
 
-    gap_rows = demand_df[demand_df["MBQ_Gap"] > 0].copy()
+    gap_rows = demand_df[(demand_df["MBQ_Gap"] > 0) & demand_df["In_Input4"]].copy()
     gap_rows = gap_rows.sort_values([C4["rank"], "AG_Priority_Rank"], na_position="last")
 
     order_lines = []
@@ -882,13 +1043,12 @@ def run(input_dir=INPUT_DIR, output_dir=OUTPUT_DIR, run_date=None):
     soh_df = build_ag_mapping(soh_df, official_ags, log)
     ag_pack_df, pack_inconsistent_df = analyze_ag_pack_qty(soh_df, log)
     soh_df = compute_article_level_qtys(soh_df, log)
-    store_df, wh_df = split_store_wh(soh_df, log)
+    store_all_df, wh_df = split_store_wh(soh_df, log)
 
     # ---- STEP 10: Store scope (Input-4 defines "active") ----
-    store_df, dropped_stores = apply_store_scope(store_df, input4_df, log)
+    store_df, dropped_stores = apply_store_scope(store_all_df, input4_df, log)
 
-    # ---- STEP 11-12: Aggregate Store+AG (FULL cross-join universe) and WH pools ----
-    store_agg = aggregate_store_ag(store_df, active_stores, official_ags, log)
+    # ---- STEP 12: WH pools ----
     wh_article = aggregate_wh_article(wh_df, log)
     wh_ag = aggregate_wh_ag(wh_df, log)
     wh_loc_breakdown = analyze_wh_storage_locations(wh_df, log)
@@ -901,8 +1061,19 @@ def run(input_dir=INPUT_DIR, output_dir=OUTPUT_DIR, run_date=None):
     input6_raw_qty = input6_df[C6["qty_7d"]].sum()
     input6_df = clip_negative_sales(input6_df, log)
     input6_clipped_qty = input6_df[C6["qty_7d"]].sum()
-    # Input-6 rows for stores that are NOT ranked in Input-4 (excluded by the store-scope rule)
-    input6_excluded = input6_df[~input6_df[C6["store"]].isin(active_stores)].copy()
+
+    # ---- STEP 10b / 11: stores in SOH but NOT in Input-4, then the Store+AG universe ----
+    # Ranked stores come first, then any unranked store that holds stock. Unranked stores are shown
+    # in Output-2 (flag 'Store in Input-4' = N) but never receive orders and never enter the KPIs.
+    unranked_df, holding_unranked = analyze_unranked_stores(store_all_df, active_stores, input2_df, input6_df, log)
+    store_order = sorted(active_stores) + sorted(holding_unranked)
+    covered_stores = set(store_order)
+    store_cov_df = store_all_df[store_all_df[C["site"]].isin(covered_stores)]
+    store_agg = aggregate_store_ag(store_cov_df, store_order, official_ags, log, n_unranked=len(holding_unranked))
+    unmapped_ag_df = analyze_unmapped_ags(soh_df, log)
+
+    # Input-6 rows for stores that do not appear in Output-2 at all
+    input6_excluded = input6_df[~input6_df[C6["store"]].isin(covered_stores)].copy()
 
     # Sum any duplicate Store+AG rows in Input-6 before merging (never silently
     # drop or overwrite one of a pair of duplicate rows)
@@ -963,7 +1134,7 @@ def run(input_dir=INPUT_DIR, output_dir=OUTPUT_DIR, run_date=None):
                f"+{clip_adj:,.0f} from clipping negative sales to 0 = {input6_clipped_qty:,.0f}. "
                f"Of this: {total_qty_output:,.0f} appears in Output-2; {excl_qty:,.0f} units "
                f"(sales value {excl_sales:,.0f}) belong to store(s) {[int(s) for s in sorted(input6_excluded[C6['store']].unique())]} "
-               f"which have sales in Input-6 but NO rank in Input-4, so they are outside the active-store scope. "
+               f"which have sales in Input-6 but are not in Output-2 (no rank in Input-4 AND no stock in SOH). "
                f"Unexplained difference = {recon_diff:,.0f} "
                f"{'(FULLY RECONCILED)' if recon_diff == 0 else '(INVESTIGATE)'}")
 
@@ -980,7 +1151,7 @@ def run(input_dir=INPUT_DIR, output_dir=OUTPUT_DIR, run_date=None):
                f"-> {paths['output1']}")
 
     # ---- STEP 21: Build Output-2 (Store x AG diagnostic report) ----
-    site_desc_map = store_df.drop_duplicates(C["site"]).set_index(C["site"])[C["site_desc"]].to_dict()
+    site_desc_map = store_all_df.drop_duplicates(C["site"]).set_index(C["site"])[C["site_desc"]].to_dict()
     demand_df["Site_Desc"] = demand_df[C["site"]].map(site_desc_map)
 
     # AG-level PACK_Qty representative (highest non-zero value, per confirmed rule)
@@ -1013,14 +1184,16 @@ def run(input_dir=INPUT_DIR, output_dir=OUTPUT_DIR, run_date=None):
         C6["sales_7d"]: "Sales_L7D",
         C6["qty_7d"]: "Qty_SLD_L7D",
         "Has_SOH_Presence": "Stock Present in SOH (Y/N)",
+        "In_Input4": "Store in Input-4 (Y/N)",
     }).copy()
     store_rows["Stock Present in SOH (Y/N)"] = store_rows["Stock Present in SOH (Y/N)"].map({True: "Y", False: "N"})
+    store_rows["Store in Input-4 (Y/N)"] = store_rows["Store in Input-4 (Y/N)"].map({True: "Y", False: "N"})
     store_rows["WH Avl."] = ""   # blank on store rows -- see WH pseudo-rows below
     store_rows["WH+GIT"] = ""
     store_rows = store_rows[[
         "Site", "Site_Desc", "Subclass_Desc", "MBQ", "VT", "VT%", "Avl_MBQ_Fill_Pct",
         "WH Avl.", "WH+GIT", "Site MBQ", "Site GIT", "TSF Expected", "PACK_Qty", "Sales_L7D", "Qty_SLD_L7D", "ROS", "CVD",
-        "Stock Present in SOH (Y/N)",
+        "Stock Present in SOH (Y/N)", "Store in Input-4 (Y/N)",
     ]].rename(columns={"Avl_MBQ_Fill_Pct": "Avl.MBQ Fill%"})
 
     # WH pseudo-rows: one per AG, SITE=9950, carrying WH Avl./WH+GIT only
@@ -1040,7 +1213,7 @@ def run(input_dir=INPUT_DIR, output_dir=OUTPUT_DIR, run_date=None):
         "WH+GIT": wh_ag_full["WH_Final_Available_Qty"] + wh_ag_full["WH_Final_GIT_Qty"],
         "Site MBQ": "", "Site GIT": "", "TSF Expected": "", "PACK_Qty": wh_ag_full["PACK_Qty_Representative"],
         "Sales_L7D": "", "Qty_SLD_L7D": "", "ROS": "", "CVD": "",
-        "Stock Present in SOH (Y/N)": "",
+        "Stock Present in SOH (Y/N)": "", "Store in Input-4 (Y/N)": "",
     })
 
     output2 = pd.concat([store_rows, wh_rows], ignore_index=True)
@@ -1049,8 +1222,9 @@ def run(input_dir=INPUT_DIR, output_dir=OUTPUT_DIR, run_date=None):
                f"{len(wh_rows):,} WH (SITE {WH_SITE_CODE}) summary rows appended at the end, "
                f"one per AG. WH Avl./WH+GIT no longer repeated on every store row.")
 
-    # ---- Overall aggregate KPIs ----
-    has_target = demand_df[C2["final_mbq"]].notna()
+    # ---- Overall aggregate KPIs (ranked Input-4 stores only) ----
+    demand_active = demand_df[demand_df["In_Input4"]]
+    has_target = demand_df[C2["final_mbq"]].notna() & demand_df["In_Input4"]
     overall_vt_pct = (
         demand_df.loc[has_target, "VT_Available"].sum() / demand_df.loc[has_target, C2["final_vt"]].sum()
     ) if demand_df.loc[has_target, C2["final_vt"]].sum() > 0 else 0
@@ -1069,12 +1243,16 @@ def run(input_dir=INPUT_DIR, output_dir=OUTPUT_DIR, run_date=None):
             "Overall VT% (all Store+AG rows with a target)",
             "Overall MBQ% — Before Order",
             "Overall MBQ% — After Order",
-            "Input-6 Qty excluded (store has sales but no rank in Input-4)",
+            "Input-6 Qty excluded (store not in Output-2: no rank in Input-4 AND no stock in SOH)",
             "Input-6 Qty unexplained difference (should be 0)",
+            "Unranked stores holding stock, listed in Output-2 with no orders (count)",
+            f"Unranked stores with stock position (on hand + in transit + expected) above {UNRANKED_STORE_STOCK_ALERT_QTY:,} units (ALERT count)",
         ],
         "Value": [
             f"{total_order_qty:,.0f}", f"{overall_vt_pct:.1%}", f"{overall_mbq_before:.1%}",
             f"{overall_mbq_after:.1%}", f"{excl_qty:,.0f}", f"{recon_diff:,.0f}",
+            f"{len(holding_unranked)}",
+            f"{int(unranked_df['Alert'].str.startswith('ALERT').sum()) if len(unranked_df) else 0}",
         ],
     })
     with pd.ExcelWriter(paths["output2"], mode="a", engine="openpyxl") as xw:
@@ -1086,10 +1264,11 @@ def run(input_dir=INPUT_DIR, output_dir=OUTPUT_DIR, run_date=None):
     log.append(f"  Overall VT%:                   {overall_vt_pct:.1%}")
     log.append(f"  Overall MBQ% (Before Order):   {overall_mbq_before:.1%}")
     log.append(f"  Overall MBQ% (After Order):    {overall_mbq_after:.1%}")
+    log.append("  (KPIs cover ranked Input-4 stores only; unranked stores are listed in Output-2 for visibility.)")
     log.append(f"STEP 21b: Output-2 written (Detail + WH rows + Summary sheet) -> {paths['output2']}")
 
     # ---- STEP 22: Exceptions report ----
-    with pd.ExcelWriter(paths["exceptions"]) as xw:
+    with pd.ExcelWriter(paths["exceptions"], engine="openpyxl") as xw:
         readme = pd.DataFrame({
             "Sheet": ["Unranked Stores", "Unmapped AG Names (data-quality)", "Zero-Stock Store+AG Combos",
                       "No Target in Input-2", "Input-6 Sales Excluded",
@@ -1097,22 +1276,28 @@ def run(input_dir=INPUT_DIR, output_dir=OUTPUT_DIR, run_date=None):
                       "NSO Blocked Stock (Location 40)", "WH Storage Location Breakdown",
                       "WH Stock by Season"],
             "What it means": [
-                "Store codes found in SOH but with NO rank in Input-4 -- excluded from the whole "
-                "analysis (not-yet-opened or closing store).",
-                "SOH rows whose SUBCLASS_DESC text did NOT match the official 52-AG list after "
-                "normalization -- a NAME/SPELLING problem, e.g. junk or unrecognized AG labels. "
-                "This is DIFFERENT from a store simply not carrying an AG (see next sheet).",
+                "Every store found in SOH that has NO rank in Input-4 (not-yet-opened, closing, or simply "
+                "missing from the input file), with store name, region, state, city, status, stock "
+                "(available / GIT / TSF expected) and last-7-day sales, so you can decide whether Input-4 "
+                f"needs correcting. RED = stock position (on hand + in transit + expected) above {UNRANKED_STORE_STOCK_ALERT_QTY:,} units (ALERT), "
+                "AMBER = holds some stock. Stores holding stock ARE shown in Output-2 (flag 'Store in "
+                "Input-4'=N) but get no orders and are left out of the KPIs.",
+                "Full SOH hierarchy (Division / Group / Department / Class / SubClass) of every AG name that "
+                "did NOT match the official 52-AG list after normalization, with the reason, how many stores "
+                "hold stock under it, store stock and WH 9950 stock. Stores + WH 9950 only. A NAME problem -- "
+                "DIFFERENT from a store simply not carrying an AG (see next sheet).",
                 "Active Store+AG combinations with ZERO SOH presence at all (no stock, GIT, or "
                 "TSF_Expected for any Article) -- this is the correct place to check your "
                 "'space-crunch, AG deliberately not carried at this store' question. These rows "
                 "ARE still included in Output-2 (as zero rows, flagged 'Stock Present in SOH'=N) "
                 "so the true gap size is visible -- they are listed here again just as a quick "
-                "filtered view.",
+                "filtered view. (Ranked Input-4 stores only.)",
                 "Active Store+AG combinations that have NO row in Input-2 (no VT/MBQ target). "
                 "This is the closest signal for 'this AG is not planned for this store' (e.g. space "
-                "crunch). Output-2 shows blank MBQ/VT for these and no order is raised for them.",
-                "Input-6 sales rows for stores that have NO rank in Input-4 (outside the active-store "
-                "scope). Sales exist, so check whether these stores should be added to Input-4.",
+                "crunch). Output-2 shows blank MBQ/VT for these and no order is raised for them. "
+                "(Ranked Input-4 stores only.)",
+                "Input-6 sales rows for stores that are NOT in Output-2 at all (no rank in Input-4 AND no "
+                "stock in SOH). Sales exist, so check whether these stores should be added to Input-4.",
                 "AGs where more than one PACK_QTY value appears on a row that ACTUALLY HOLDS STOCK -- "
                 "the value from the stock-holding row with the most stock is used as the "
                 "representative PACK_Qty; review for data-entry errors.",
@@ -1133,16 +1318,14 @@ def run(input_dir=INPUT_DIR, output_dir=OUTPUT_DIR, run_date=None):
         })
         readme.to_excel(xw, sheet_name="README", index=False)
 
-        pd.DataFrame({"Dropped Store Code (no rank in Input-4)": sorted(dropped_stores)}).to_excel(
-            xw, sheet_name="Unranked Stores", index=False)
-        unmapped_ags = soh_df[soh_df["AG_Mapped"].isna()][[C["site"], C["subclass"]]].drop_duplicates()
-        unmapped_ags.to_excel(xw, sheet_name="Unmapped AG Names", index=False)
+        unranked_df.to_excel(xw, sheet_name="Unranked Stores", index=False)
+        unmapped_ag_df.to_excel(xw, sheet_name="Unmapped AG Names", index=False)
 
-        zero_stock = demand_df[~demand_df["Has_SOH_Presence"]][[C["site"], "AG_Mapped"]].rename(
+        zero_stock = demand_active[~demand_active["Has_SOH_Presence"]][[C["site"], "AG_Mapped"]].rename(
             columns={C["site"]: "Store Code", "AG_Mapped": "AG"})
         zero_stock.to_excel(xw, sheet_name="Zero-Stock Store+AG Combos", index=False)
 
-        no_target = demand_df[demand_df[C2["final_mbq"]].isna()][[C["site"], "AG_Mapped"]].rename(
+        no_target = demand_active[demand_active[C2["final_mbq"]].isna()][[C["site"], "AG_Mapped"]].rename(
             columns={C["site"]: "Store Code", "AG_Mapped": "AG"})
         no_target.to_excel(xw, sheet_name="No Target in Input-2", index=False)
         input6_excluded.to_excel(xw, sheet_name="Input-6 Sales Excluded", index=False)
@@ -1152,15 +1335,45 @@ def run(input_dir=INPUT_DIR, output_dir=OUTPUT_DIR, run_date=None):
         nso_blocked_df.to_excel(xw, sheet_name="NSO Blocked Stock (Loc 40)", index=False)
         wh_loc_breakdown.to_excel(xw, sheet_name="WH Storage Location Breakdown", index=False)
         wh_season_df.to_excel(xw, sheet_name="WH Stock by Season", index=False)
+
+        # ---- formatting: highlight stores missing from Input-4, readable column widths ----
+        red = PatternFill("solid", start_color="FFC7CE", end_color="FFC7CE")
+        amber = PatternFill("solid", start_color="FFEB9C", end_color="FFEB9C")
+        ws_un = xw.sheets["Unranked Stores"]
+        alert_idx = list(unranked_df.columns).index("Alert") + 1
+        for r in range(2, ws_un.max_row + 1):
+            msg = str(ws_un.cell(row=r, column=alert_idx).value or "")
+            fill = red if msg.startswith("ALERT") else amber if msg.startswith("Holds stock") else None
+            if fill is not None:
+                for c in range(1, ws_un.max_column + 1):
+                    cell = ws_un.cell(row=r, column=c)
+                    cell.fill = fill
+                    if fill is red:
+                        cell.font = Font(bold=True)
+        for ws in xw.book.worksheets:
+            for col in ws.columns:
+                longest = max((len(str(c.value)) for c in col[:300] if c.value is not None), default=8)
+                ws.column_dimensions[col[0].column_letter].width = min(max(10, longest + 2), 60)
+        ws_readme = xw.sheets["README"]
+        ws_readme.column_dimensions["A"].width = 40
+        ws_readme.column_dimensions["B"].width = 130
+        for cell in ws_readme["B"]:
+            cell.alignment = Alignment(wrap_text=True, vertical="top")
     log.append(f"STEP 22: Exceptions report written (with a README sheet explaining each tab) -> {paths['exceptions']}")
 
     # ---- DATA QUALITY ERRORS SUMMARY ----
-    n_missing_target = demand_df[C2["final_mbq"]].isna().sum()
-    n_zero_stock = (~demand_df["Has_SOH_Presence"]).sum()
+    n_missing_target = demand_active[C2["final_mbq"]].isna().sum()
+    n_zero_stock = (~demand_active["Has_SOH_Presence"]).sum()
     log.append("-" * 78)
     log.append("DATA QUALITY ERRORS SUMMARY (see Exceptions_Report for full detail, incl. a README sheet)")
-    log.append(f"  Stores dropped (no rank in Input-4):           {len(dropped_stores)}")
-    log.append(f"  SOH rows with unmapped AG name (spelling issue): {(soh_df['AG_Mapped'].isna()).sum():,}")
+    n_alert = int(unranked_df['Alert'].str.startswith('ALERT').sum()) if len(unranked_df) else 0
+    log.append(f"  Stores in SOH NOT ranked in Input-4:            {len(dropped_stores)} "
+               f"({len(holding_unranked)} hold stock -> listed in Output-2, no orders)")
+    if n_alert:
+        log.append(f"  *** ALERT: {n_alert} unranked store(s) have a stock position above {UNRANKED_STORE_STOCK_ALERT_QTY:,} units "
+                   f"-- fix Input-4 (see Exceptions sheet 'Unranked Stores', highlighted red)")
+    log.append(f"  Unmapped AG hierarchy combos (stores + WH 9950): {len(unmapped_ag_df)} "
+               f"({int(unmapped_ag_df['SOH Rows'].sum()) if len(unmapped_ag_df) else 0:,} SOH rows)")
     log.append(f"  Active Store+AG combos with ZERO SOH presence:  {n_zero_stock:,} "
                f"(store genuinely not carrying / sold out of that AG -- review if unintended)")
     log.append(f"  AGs with inconsistent PACK_QTY across Articles: {len(pack_inconsistent_df)} "
@@ -1172,12 +1385,13 @@ def run(input_dir=INPUT_DIR, output_dir=OUTPUT_DIR, run_date=None):
                f"{len(nso_blocked_df):,} Site+AG combos -- excluded from WH Avl. everywhere")
 
     # ---- Summary ----
-    total_gap_before = demand_df["MBQ_Gap"].sum()
-    total_gap_after = (demand_df["Effective_MBQ"] - demand_df["New_Effective_Position"]).clip(lower=0).sum()
+    total_gap_before = demand_active["MBQ_Gap"].sum()
+    total_gap_after = (demand_active["Effective_MBQ"] - demand_active["New_Effective_Position"]).clip(lower=0).sum()
     log.append("-" * 78)
     log.append("RUN SUMMARY")
-    log.append(f"  Store+AG rows evaluated:      {len(demand_df):,}")
-    log.append(f"  Rows with a real MBQ gap:     {(demand_df['MBQ_Gap']>0).sum():,}")
+    log.append(f"  Store+AG rows evaluated:      {len(demand_active):,} (ranked Input-4 stores)")
+    log.append(f"  Extra rows for unranked stores holding stock (no orders): {len(demand_df)-len(demand_active):,}")
+    log.append(f"  Rows with a real MBQ gap:     {(demand_active['MBQ_Gap']>0).sum():,}")
     log.append(f"  Total gap (units) BEFORE:     {total_gap_before:,.0f}")
     log.append(f"  Total gap (units) AFTER order:{total_gap_after:,.0f}")
     log.append(f"  Order lines raised:           {len(output1):,}")
